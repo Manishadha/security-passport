@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     postgres_host: str = "localhost"
     postgres_port: int = 5432
     redis_url: str = "redis://127.0.0.1:56379/0"
+    jwt_secret_key: str = "dev-change-me"
+    jwt_issuer: str = "securitypassport"
+    jwt_access_token_minutes: int = 60
+
 
     @property
     def database_url(self) -> str:

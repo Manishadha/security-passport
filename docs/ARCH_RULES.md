@@ -30,3 +30,7 @@ Architecture Guardrails
 7) No hidden coupling
 - Infrastructure is accessed via interfaces (storage, queue, billing).
 - Business logic lives in services, not in route handlers.
+
+8) ORM reserved names
+- Do not use 'metadata' as a SQLAlchemy attribute name. Use 'meta' and map to column 'metadata'.
+printf "\n8) ORM reserved names\n- Do not use 'metadata' as a SQLAlchemy attribute name. Use 'meta' and map to column 'metadata'.\n" >> docs/ARCH_RULES.md
