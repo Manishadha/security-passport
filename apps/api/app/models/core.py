@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+import sqlalchemy as sa
 
 from sqlalchemy import DateTime, ForeignKey, Index, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -83,3 +84,25 @@ class Subscription(Base):
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="trialing")
     plan: Mapped[str] = mapped_column(String(50), nullable=False, default="trial")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+class JobRun(Base):
+    __tablename__ = "job_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    job_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    rq_job_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="queued")
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_job_runs_tenant_created", "tenant_id", "created_at"),
+        Index("ix_job_runs_tenant_type_created", "tenant_id", "job_type", "created_at"),
+    )
+

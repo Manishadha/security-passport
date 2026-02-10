@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     postgres_password: str
     postgres_host: str = "localhost"
     postgres_port: int = 5432
+    redis_url: str = "redis://127.0.0.1:56379/0"
 
     @property
     def database_url(self) -> str:
