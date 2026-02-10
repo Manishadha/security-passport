@@ -11,6 +11,7 @@ from app.core.settings import settings
 from app.core.audit import write_audit
 from app.db.session import SessionLocal
 from app.models.core import Tenant, User, Membership
+from app.api.evidence import router as evidence_router
 
 app = FastAPI(title="securitypassport")
 
@@ -99,3 +100,6 @@ def me(ctx: TenantContext = Depends(get_ctx)) -> MeResponse:
         role=ctx.role,
         email=ctx.email,
     )
+
+
+app.include_router(evidence_router)

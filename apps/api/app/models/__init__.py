@@ -6,4 +6,5 @@ from app.models.core import (
     BillingCustomer,
     Subscription,
     JobRun,
+    EvidenceItem,
 )

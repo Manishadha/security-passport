@@ -106,3 +106,23 @@ class JobRun(Base):
         Index("ix_job_runs_tenant_type_created", "tenant_id", "job_type", "created_at"),
     )
 
+
+class EvidenceItem(Base):
+    __tablename__ = "evidence_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    storage_key: Mapped[str | None] = mapped_column(String(600), nullable=True, unique=True)
+    content_type: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    size_bytes: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_evidence_tenant_created", "tenant_id", "created_at"),
+        Index("ix_evidence_tenant_title", "tenant_id", "title"),
+    )

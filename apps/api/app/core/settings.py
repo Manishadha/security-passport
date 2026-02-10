@@ -14,6 +14,12 @@ class Settings(BaseSettings):
     jwt_secret_key: str = "dev-change-me"
     jwt_issuer: str = "securitypassport"
     jwt_access_token_minutes: int = 60
+    s3_endpoint: str
+    s3_access_key: str
+    s3_secret_key: str
+    s3_bucket: str
+    s3_region: str = "us-east-1"
+
 
 
     @property

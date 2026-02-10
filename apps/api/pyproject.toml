@@ -19,6 +19,8 @@ redis = "^7.1.1"
 rq = "^2.6.1"
 email-validator = "^2.3.0"
 bcrypt = "3.2.2"
+boto3 = "^1.42.45"
+python-multipart = "^0.0.22"
 
 
 [tool.poetry.group.dev.dependencies]
