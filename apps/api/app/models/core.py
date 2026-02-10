@@ -15,6 +15,7 @@ class Tenant(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class User(Base):
@@ -24,6 +25,7 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Membership(Base):
@@ -38,6 +40,7 @@ class Membership(Base):
     )
     role: Mapped[str] = mapped_column(String(50), nullable=False, default="member")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (Index("ix_memberships_tenant_user", "tenant_id", "user_id", unique=True),)
 
@@ -57,6 +60,7 @@ class AuditEvent(Base):
     object_id: Mapped[str] = mapped_column(String(200), nullable=False)
     meta: Mapped[dict] = mapped_column('metadata', JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index("ix_audit_tenant_created", "tenant_id", "created_at"),
@@ -84,6 +88,7 @@ class Subscription(Base):
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="trialing")
     plan: Mapped[str] = mapped_column(String(50), nullable=False, default="trial")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 class JobRun(Base):
     __tablename__ = "job_runs"
@@ -99,6 +104,7 @@ class JobRun(Base):
     attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
@@ -117,10 +123,12 @@ class EvidenceItem(Base):
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     description: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     storage_key: Mapped[str | None] = mapped_column(String(600), nullable=True, unique=True)
+    original_filename: Mapped[str | None] = mapped_column(String(512), nullable=True)
     content_type: Mapped[str | None] = mapped_column(String(200), nullable=True)
     content_hash: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     size_bytes: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index("ix_evidence_tenant_created", "tenant_id", "created_at"),

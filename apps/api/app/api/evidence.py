@@ -58,6 +58,9 @@ def list_evidence(ctx: TenantContext = Depends(get_ctx)) -> list[dict]:
                 "description": r.description,
                 "created_at": r.created_at.isoformat(),
                 "storage_key": r.storage_key,
+                "original_filename": r.original_filename,
+                "uploaded_at": r.uploaded_at.isoformat() if r.uploaded_at else None,
+
             }
             for r in rows
         ]
@@ -89,9 +92,11 @@ async def upload_file(evidence_id: str, file: UploadFile = File(...), ctx: Tenan
             raise HTTPException(status_code=404, detail="not found")
 
         item.storage_key = storage_key
+        item.original_filename = file.filename
         item.content_type = file.content_type or "application/octet-stream"
         item.content_hash = sha256
         item.size_bytes = len(data)
+        item.uploaded_at = datetime.utcnow()
 
         write_audit(
             db=session,

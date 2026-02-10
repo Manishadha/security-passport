@@ -12,8 +12,15 @@ from app.core.audit import write_audit
 from app.db.session import SessionLocal
 from app.models.core import Tenant, User, Membership
 from app.api.evidence import router as evidence_router
+from app.core.queue import get_redis
 
 app = FastAPI(title="securitypassport")
+
+@app.get("/health/redis")
+def health_redis() -> dict:
+    r = get_redis()
+    r.ping()
+    return {"status": "ok"}
 
 @app.get("/health")
 def health() -> dict:
