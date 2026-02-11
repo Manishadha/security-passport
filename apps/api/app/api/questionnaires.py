@@ -291,3 +291,63 @@ def export_pack(template_code: str, ctx: TenantContext = Depends(get_ctx)):
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+@router.get("/status/{template_code}")
+def pack_status(template_code: str, ctx: TenantContext = Depends(get_ctx)) -> dict:
+    with SessionLocal() as session:
+        tpl = session.execute(
+            select(QuestionnaireTemplate).where(QuestionnaireTemplate.code == template_code)
+        ).scalar_one_or_none()
+        if tpl is None:
+            raise HTTPException(status_code=404, detail="template not found")
+
+        questions = session.execute(
+            select(QuestionnaireQuestion)
+            .where(QuestionnaireQuestion.template_id == tpl.id)
+            .order_by(QuestionnaireQuestion.key.asc())
+        ).scalars().all()
+
+        q_by_id = {q.id: q for q in questions}
+        qids = list(q_by_id.keys())
+
+        answers = []
+        if qids:
+            answers = session.execute(
+                select(TenantAnswer).where(
+                    TenantAnswer.tenant_id == ctx.tenant_id,
+                    TenantAnswer.question_id.in_(qids),
+                )
+            ).scalars().all()
+
+        answered_qids = {a.question_id for a in answers}
+        unanswered = [q_by_id[qid].key for qid in qids if qid not in answered_qids]
+
+        ans_ids = [a.id for a in answers]
+        links = []
+        if ans_ids:
+            links = session.execute(
+                select(TenantAnswerEvidence).where(
+                    TenantAnswerEvidence.tenant_id == ctx.tenant_id,
+                    TenantAnswerEvidence.answer_id.in_(ans_ids),
+                )
+            ).scalars().all()
+
+        evidence_by_answer: dict[uuid.UUID, int] = {}
+        for l in links:
+            evidence_by_answer[l.answer_id] = evidence_by_answer.get(l.answer_id, 0) + 1
+
+        answers_missing_evidence = []
+        for a in answers:
+            if evidence_by_answer.get(a.id, 0) == 0:
+                answers_missing_evidence.append(q_by_id[a.question_id].key)
+
+        distinct_evidence_ids = sorted({l.evidence_id for l in links})
+
+        return {
+            "template_code": tpl.code,
+            "total_questions": len(questions),
+            "answered": len(answers),
+            "unanswered_keys": unanswered,
+            "answers_missing_evidence_keys": answers_missing_evidence,
+            "attached_evidence_count": len(distinct_evidence_ids),
+        }
