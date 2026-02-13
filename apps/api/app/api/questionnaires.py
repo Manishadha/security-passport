@@ -351,3 +351,172 @@ def pack_status(template_code: str, ctx: TenantContext = Depends(get_ctx)) -> di
             "answers_missing_evidence_keys": answers_missing_evidence,
             "attached_evidence_count": len(distinct_evidence_ids),
         }
+
+import io
+from docx import Document
+from docx.shared import Pt
+from fastapi.responses import Response
+
+
+@router.get("/export-docx/{template_code}")
+def export_pack_docx(template_code: str, ctx: TenantContext = Depends(get_ctx)):
+    with SessionLocal() as session:
+        tpl = session.execute(
+            select(QuestionnaireTemplate).where(QuestionnaireTemplate.code == template_code)
+        ).scalar_one_or_none()
+        if tpl is None:
+            raise HTTPException(status_code=404, detail="template not found")
+
+        questions = session.execute(
+            select(QuestionnaireQuestion).where(QuestionnaireQuestion.template_id == tpl.id)
+        ).scalars().all()
+        qmap = {q.id: q for q in questions}
+        qids = list(qmap.keys())
+
+        answers = []
+        if qids:
+            answers = session.execute(
+                select(TenantAnswer).where(
+                    TenantAnswer.tenant_id == ctx.tenant_id,
+                    TenantAnswer.question_id.in_(qids),
+                )
+            ).scalars().all()
+
+        ans_ids = [a.id for a in answers]
+        links = []
+        if ans_ids:
+            links = session.execute(
+                select(TenantAnswerEvidence).where(
+                    TenantAnswerEvidence.tenant_id == ctx.tenant_id,
+                    TenantAnswerEvidence.answer_id.in_(ans_ids),
+                )
+            ).scalars().all()
+
+        answer_to_evidence: dict[uuid.UUID, list[uuid.UUID]] = {}
+        for l in links:
+            answer_to_evidence.setdefault(l.answer_id, []).append(l.evidence_id)
+
+        ev_ids = sorted({l.evidence_id for l in links})
+        evidences = []
+        if ev_ids:
+            evidences = session.execute(
+                select(EvidenceItem).where(
+                    EvidenceItem.tenant_id == ctx.tenant_id,
+                    EvidenceItem.id.in_(ev_ids),
+                )
+            ).scalars().all()
+
+        doc = Document()
+        title = doc.add_heading(f"{tpl.name} — Security Pack", level=0)
+        if title.runs:
+            title.runs[0].font.size = Pt(20)
+
+        doc.add_paragraph(f"Template: {tpl.code} ({tpl.version}, {tpl.language})")
+        doc.add_paragraph(f"Tenant ID: {ctx.tenant_id}")
+        doc.add_paragraph(f"Generated at (UTC): {datetime.utcnow().isoformat()}")
+
+        doc.add_paragraph("")
+        doc.add_heading("Answers", level=1)
+
+        table = doc.add_table(rows=1, cols=4)
+        hdr = table.rows[0].cells
+        hdr[0].text = "Question"
+        hdr[1].text = "Answer"
+        hdr[2].text = "Updated (UTC)"
+        hdr[3].text = "Evidence IDs"
+
+        for a in sorted(answers, key=lambda x: qmap[x.question_id].key):
+            q = qmap[a.question_id]
+            ev_list = [str(eid) for eid in sorted(answer_to_evidence.get(a.id, []))]
+            row = table.add_row().cells
+            row[0].text = f"{q.key}\n{q.prompt}"
+            row[1].text = a.answer_text
+            row[2].text = a.updated_at.isoformat()
+            row[3].text = "\n".join(ev_list) if ev_list else ""
+
+        doc.add_paragraph("")
+        doc.add_heading("Evidence Inventory", level=1)
+
+        ev_table = doc.add_table(rows=1, cols=6)
+        eh = ev_table.rows[0].cells
+        eh[0].text = "Evidence ID"
+        eh[1].text = "Title"
+        eh[2].text = "Original filename"
+        eh[3].text = "Uploaded at (UTC)"
+        eh[4].text = "Content hash"
+        eh[5].text = "Storage key"
+
+        for e in sorted(evidences, key=lambda x: x.created_at, reverse=True):
+            row = ev_table.add_row().cells
+            row[0].text = str(e.id)
+            row[1].text = e.title or ""
+            row[2].text = e.original_filename or ""
+            row[3].text = e.uploaded_at.isoformat() if e.uploaded_at else ""
+            row[4].text = e.content_hash or ""
+            row[5].text = e.storage_key or ""
+
+        buf = io.BytesIO()
+        doc.save(buf)
+        data = buf.getvalue()
+
+        write_audit(
+            db=session,
+            tenant_id=ctx.tenant_id,
+            actor_user_id=ctx.user_id,
+            action="pack.export_docx",
+            object_type="template",
+            object_id=tpl.code,
+            meta={},
+        )
+        session.commit()
+
+    filename = f"{template_code}_pack.docx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+def render_docx_bytes(pack: dict) -> bytes:
+    # Minimal DOCX generator used by /passport export.
+    from io import BytesIO
+    doc = Document()
+
+    tpl = (pack or {}).get('template') or {}
+    doc.add_heading('Security Passport', level=0)
+    doc.add_paragraph(f"Template: {tpl.get('name','')} ({tpl.get('code','')})")
+    doc.add_paragraph(f"Version: {tpl.get('version','')}  Language: {tpl.get('language','')}")
+    doc.add_paragraph(f"Tenant: {pack.get('tenant_id','')}")
+    doc.add_paragraph(f"Generated at: {pack.get('generated_at','')}")
+
+    doc.add_heading('Answers', level=1)
+    answers = (pack or {}).get('answers') or []
+    if not answers:
+        doc.add_paragraph('No answers yet.')
+    else:
+        for a in answers:
+            doc.add_heading(a.get('question_key') or 'question', level=2)
+            if a.get('question_prompt'):
+                doc.add_paragraph(a['question_prompt'])
+            doc.add_paragraph(a.get('answer_text') or '')
+            ev_ids = a.get('evidence_ids') or []
+            if ev_ids:
+                doc.add_paragraph('Evidence IDs: ' + ', '.join(ev_ids))
+
+    doc.add_heading('Evidence', level=1)
+    evidence = (pack or {}).get('evidence') or []
+    if not evidence:
+        doc.add_paragraph('No evidence attached.')
+    else:
+        for ev in evidence:
+            doc.add_heading(ev.get('title') or ev.get('id') or 'evidence', level=2)
+            if ev.get('description'):
+                doc.add_paragraph(ev['description'])
+            doc.add_paragraph(f"Original filename: {ev.get('original_filename')}")
+            doc.add_paragraph(f"Uploaded at: {ev.get('uploaded_at')}")
+            doc.add_paragraph(f"Content hash: {ev.get('content_hash')}")
+            doc.add_paragraph(f"Storage key: {ev.get('storage_key')}")
+
+    buf = BytesIO()
+    doc.save(buf)
+    return buf.getvalue()

@@ -21,6 +21,10 @@ email-validator = "^2.3.0"
 bcrypt = "3.2.2"
 boto3 = "^1.42.45"
 python-multipart = "^0.0.22"
+python-docx = "^1.2.0"
+minio = "^7.2.20"
+python-dotenv = "^1.2.1"
+httpx = "^0.28.1"
 
 
 [tool.poetry.group.dev.dependencies]

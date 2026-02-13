@@ -18,6 +18,7 @@ from app.core.audit import write_audit
 from app.db.session import SessionLocal
 from app.models.core import Tenant, User, Membership
 from app.api.evidence import router as evidence_router
+from app.api.passport import router as passport_router
 from app.api.questionnaires import router as questionnaires_router
 from app.api.health import router as health_router
 from app.core.queue import get_redis
@@ -118,6 +119,7 @@ def me(ctx: TenantContext = Depends(get_ctx)) -> MeResponse:
 
 
 app.include_router(evidence_router)
+app.include_router(passport_router)
 
 app.include_router(questionnaires_router)
 app.include_router(health_router)
