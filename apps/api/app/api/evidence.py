@@ -12,6 +12,34 @@ from app.core.settings import settings
 from app.db.session import SessionLocal
 from app.models.core import EvidenceItem
 
+
+def get_download_url(storage_key: str) -> dict:
+    import os
+
+    endpoint = os.getenv("S3_ENDPOINT")
+    access_key = os.getenv("S3_ACCESS_KEY")
+    secret_key = os.getenv("S3_SECRET_KEY")
+    bucket = os.getenv("S3_BUCKET")
+    region = os.getenv("S3_REGION") or "us-east-1"
+
+    if not endpoint or not access_key or not secret_key or not bucket:
+        raise RuntimeError("S3 env is not configured")
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+    )
+
+    url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": storage_key},
+        ExpiresIn=300,
+    )
+    return {"url": url, "expires_in_seconds": 300}
+
 router = APIRouter(prefix="/evidence", tags=["evidence"])
 
 @router.post("")
