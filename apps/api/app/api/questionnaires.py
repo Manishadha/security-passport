@@ -7,20 +7,27 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select
 
 from app.core.auth import TenantContext, get_ctx
 from app.core.audit import write_audit
 from app.db.session import SessionLocal
 from app.models.core import EvidenceItem
-from app.models.questionnaires import (
-    QuestionnaireTemplate,
-    QuestionnaireQuestion,
-    TenantAnswer,
-    TenantAnswerEvidence,
-)
 
 router = APIRouter(prefix="/questionnaires", tags=["questionnaires"])
+
+
+def _q_tables(session):
+    import sqlalchemy as sa
+
+    md = sa.MetaData()
+    bind = session.get_bind()
+    insp = sa.inspect(bind)
+
+    tpls = sa.Table("questionnaire_templates", md, autoload_with=bind)
+    qs = sa.Table("questionnaire_questions", md, autoload_with=bind)
+    ans = sa.Table("tenant_answers", md, autoload_with=bind)
+    ae = sa.Table("tenant_answer_evidence", md, autoload_with=bind) if "tenant_answer_evidence" in insp.get_table_names() else None
+    return md, bind, tpls, qs, ans, ae
 
 
 class UpsertAnswerRequest(BaseModel):
@@ -33,45 +40,53 @@ class AttachEvidenceRequest(BaseModel):
 
 @router.get("/templates")
 def list_templates() -> list[dict]:
+    import sqlalchemy as sa
+
     with SessionLocal() as session:
-        tpls = session.execute(
-            select(QuestionnaireTemplate).order_by(QuestionnaireTemplate.created_at.desc())
-        ).scalars().all()
+        _, _, tpls, _, _, _ = _q_tables(session)
+        rows = session.execute(
+            sa.select(tpls).order_by(tpls.c.created_at.desc())
+        ).mappings().all()
+
         return [
             {
-                "id": str(t.id),
-                "code": t.code,
-                "name": t.name,
-                "language": t.language,
-                "version": t.version,
+                "id": str(r["id"]),
+                "code": r["code"],
+                "name": r["name"],
+                "language": r.get("language"),
+                "version": r.get("version"),
             }
-            for t in tpls
+            for r in rows
         ]
 
 
 @router.get("/templates/{template_id}")
 def get_template(template_id: str) -> dict:
+    import sqlalchemy as sa
+
     tid = uuid.UUID(template_id)
     with SessionLocal() as session:
+        _, _, tpls, qs, _, _ = _q_tables(session)
+
         tpl = session.execute(
-            select(QuestionnaireTemplate).where(QuestionnaireTemplate.id == tid)
-        ).scalar_one_or_none()
+            sa.select(tpls).where(tpls.c.id == tid)
+        ).mappings().first()
         if tpl is None:
             raise HTTPException(status_code=404, detail="not found")
 
-        qs = session.execute(
-            select(QuestionnaireQuestion)
-            .where(QuestionnaireQuestion.template_id == tpl.id)
-            .order_by(QuestionnaireQuestion.key.asc())
-        ).scalars().all()
+        qrows = session.execute(
+            sa.select(qs)
+            .where(qs.c.template_id == tpl["id"])
+            .order_by(qs.c.key.asc())
+        ).mappings().all()
 
         return {
-            "id": str(tpl.id),
-            "code": tpl.code,
-            "name": tpl.name,
-            "language": tpl.language,
-            "version": tpl.version,
-            "questions": [{"id": str(q.id), "key": q.key, "prompt": q.prompt} for q in qs],
+            "id": str(tpl["id"]),
+            "code": tpl["code"],
+            "name": tpl["name"],
+            "language": tpl.get("language"),
+            "version": tpl.get("version"),
+            "questions": [{"id": str(q["id"]), "key": q["key"], "prompt": q["prompt"]} for q in qrows],
         }
 
 
@@ -81,53 +96,52 @@ def upsert_answer(
     req: UpsertAnswerRequest,
     ctx: TenantContext = Depends(get_ctx),
 ) -> dict:
+    import sqlalchemy as sa
+
     qid = uuid.UUID(question_id)
-    answer_text = req.answer_text.strip()
+    answer_text = (req.answer_text or "").strip()
     if not answer_text:
         raise HTTPException(status_code=400, detail="answer_text required")
 
     with SessionLocal() as session:
-        q = session.execute(
-            select(QuestionnaireQuestion).where(QuestionnaireQuestion.id == qid)
-        ).scalar_one_or_none()
-        if q is None:
+        _, bind, _, qs, ans, _ = _q_tables(session)
+
+        qrow = session.execute(
+            sa.select(qs).where(qs.c.id == qid)
+        ).mappings().first()
+        if qrow is None:
             raise HTTPException(status_code=404, detail="question not found")
 
-        ans = session.execute(
-            select(TenantAnswer).where(
-                TenantAnswer.tenant_id == ctx.tenant_id,
-                TenantAnswer.question_id == qid,
-            )
-        ).scalar_one_or_none()
-
         now = datetime.utcnow()
-        if ans is None:
-            ans = TenantAnswer(
+
+        existing = session.execute(
+            sa.select(ans).where(sa.and_(ans.c.tenant_id == ctx.tenant_id, ans.c.question_id == qid))
+        ).mappings().first()
+
+        if existing is None:
+            ins = ans.insert().values(
+                id=uuid.uuid4(),
                 tenant_id=ctx.tenant_id,
                 question_id=qid,
                 answer_text=answer_text,
                 updated_at=now,
-            )
-            session.add(ans)
-            session.flush()
+            ).returning(ans.c.id)
+            new_id = session.execute(ins).scalar_one()
             action = "answer.create"
+            answer_id = new_id
         else:
-            ans.answer_text = answer_text
-            ans.updated_at = now
+            upd = ans.update().where(ans.c.id == existing["id"]).values(
+                answer_text=answer_text,
+                updated_at=now,
+            )
+            session.execute(upd)
             action = "answer.update"
-
-        write_audit(
-            db=session,
-            tenant_id=ctx.tenant_id,
-            actor_user_id=ctx.user_id,
-            action=action,
-            object_type="answer",
-            object_id=str(ans.id),
-            meta={"question_id": str(qid)},
-        )
+            answer_id = existing["id"]
 
         session.commit()
-        return {"answer_id": str(ans.id)}
+
+        write_audit(session, ctx, action, {"question_id": str(qid), "answer_id": str(answer_id)})
+        return {"ok": True, "answer_id": str(answer_id)}
 
 
 @router.post("/answers/{answer_id}/evidence")
@@ -136,387 +150,128 @@ def attach_evidence(
     req: AttachEvidenceRequest,
     ctx: TenantContext = Depends(get_ctx),
 ) -> dict:
+    import sqlalchemy as sa
+
     aid = uuid.UUID(answer_id)
 
     with SessionLocal() as session:
-        ans = session.execute(
-            select(TenantAnswer).where(
-                TenantAnswer.id == aid,
-                TenantAnswer.tenant_id == ctx.tenant_id,
-            )
-        ).scalar_one_or_none()
-        if ans is None:
+        md, bind, _, _, ans, ae = _q_tables(session)
+
+        arow = session.execute(
+            sa.select(ans).where(sa.and_(ans.c.id == aid, ans.c.tenant_id == ctx.tenant_id))
+        ).mappings().first()
+        if arow is None:
             raise HTTPException(status_code=404, detail="answer not found")
 
         ev = session.execute(
-            select(EvidenceItem).where(
-                EvidenceItem.id == req.evidence_id,
-                EvidenceItem.tenant_id == ctx.tenant_id,
-            )
+            sa.select(EvidenceItem).where(EvidenceItem.id == req.evidence_id, EvidenceItem.tenant_id == ctx.tenant_id)
         ).scalar_one_or_none()
         if ev is None:
             raise HTTPException(status_code=404, detail="evidence not found")
 
-        link = session.execute(
-            select(TenantAnswerEvidence).where(
-                TenantAnswerEvidence.answer_id == aid,
-                TenantAnswerEvidence.evidence_id == req.evidence_id,
-            )
-        ).scalar_one_or_none()
+        if ae is None:
+            raise HTTPException(status_code=400, detail="evidence linking not available")
 
-        if link is None:
-            link = TenantAnswerEvidence(
+        session.execute(
+            ae.insert().values(
+                id=uuid.uuid4(),
                 tenant_id=ctx.tenant_id,
                 answer_id=aid,
                 evidence_id=req.evidence_id,
                 created_at=datetime.utcnow(),
             )
-            session.add(link)
+        )
+        session.commit()
 
-            write_audit(
-                db=session,
-                tenant_id=ctx.tenant_id,
-                actor_user_id=ctx.user_id,
-                action="answer.attach_evidence",
-                object_type="answer",
-                object_id=str(aid),
-                meta={"evidence_id": str(req.evidence_id)},
+        write_audit(session, ctx, "answer.attach_evidence", {"answer_id": str(aid), "evidence_id": str(req.evidence_id)})
+        return {"ok": True}
+
+
+@router.get("/export-pack/{template_code}.json")
+def export_pack_json(template_code: str, ctx: TenantContext = Depends(get_ctx)):
+    import sqlalchemy as sa
+
+    with SessionLocal() as session:
+        _, _, tpls, qs, ans, ae = _q_tables(session)
+
+        tpl = session.execute(
+            sa.select(tpls).where(tpls.c.code == template_code)
+        ).mappings().first()
+        if tpl is None:
+            raise HTTPException(status_code=404, detail="unknown template")
+
+        qrows = session.execute(
+            sa.select(qs).where(qs.c.template_id == tpl["id"]).order_by(qs.c.key.asc())
+        ).mappings().all()
+
+        arows = session.execute(
+            sa.select(ans).where(sa.and_(ans.c.tenant_id == ctx.tenant_id))
+        ).mappings().all()
+
+        by_qid = {r["question_id"]: r for r in arows if r.get("question_id") is not None}
+
+        ev_ids_by_answer = {}
+        if ae is not None:
+            lrows = session.execute(
+                sa.select(ae).where(ae.c.tenant_id == ctx.tenant_id)
+            ).mappings().all()
+            for lr in lrows:
+                ev_ids_by_answer.setdefault(lr["answer_id"], []).append(lr["evidence_id"])
+
+        all_ev_ids = set()
+        answers_out = []
+
+        for q in qrows:
+            ar = by_qid.get(q["id"])
+            if not ar:
+                continue
+
+            ev_ids = ev_ids_by_answer.get(ar["id"], [])
+            ev_strs = [str(x) for x in ev_ids] if ev_ids else []
+            all_ev_ids.update(ev_strs)
+
+            updated_at = ar.get("updated_at") or ar.get("created_at")
+            if updated_at is not None and hasattr(updated_at, "isoformat"):
+                updated_at = updated_at.isoformat()
+
+            answers_out.append(
+                {
+                    "question_key": q.get("key"),
+                    "question_prompt": q.get("prompt"),
+                    "answer_text": ar.get("answer_text"),
+                    "updated_at": updated_at,
+                    "evidence_ids": ev_strs if ev_strs else None,
+                }
             )
 
-            session.commit()
-
-        return {"status": "ok"}
-
-
-@router.get("/export/{template_code}")
-def export_pack(template_code: str, ctx: TenantContext = Depends(get_ctx)):
-    with SessionLocal() as session:
-        tpl = session.execute(
-            select(QuestionnaireTemplate).where(QuestionnaireTemplate.code == template_code)
-        ).scalar_one_or_none()
-        if tpl is None:
-            raise HTTPException(status_code=404, detail="template not found")
-
-        questions = session.execute(
-            select(QuestionnaireQuestion).where(QuestionnaireQuestion.template_id == tpl.id)
-        ).scalars().all()
-        qmap = {q.id: q for q in questions}
-        qids = list(qmap.keys())
-
-        answers = []
-        if qids:
-            answers = session.execute(
-                select(TenantAnswer).where(
-                    TenantAnswer.tenant_id == ctx.tenant_id,
-                    TenantAnswer.question_id.in_(qids),
+        ev_out = []
+        if all_ev_ids:
+            ev_rows = session.execute(
+                sa.select(EvidenceItem).where(sa.and_(EvidenceItem.tenant_id == ctx.tenant_id, EvidenceItem.id.in_(list(all_ev_ids))))
+            ).all()
+            for (ev,) in ev_rows:
+                ev_out.append(
+                    {
+                        "id": str(ev.id),
+                        "title": ev.title,
+                        "description": ev.description,
+                        "original_filename": ev.original_filename,
+                        "uploaded_at": ev.uploaded_at.isoformat() if ev.uploaded_at else None,
+                        "storage_key": ev.storage_key,
+                        "content_hash": ev.content_hash,
+                    }
                 )
-            ).scalars().all()
-
-        ans_ids = [a.id for a in answers]
-        links = []
-        if ans_ids:
-            links = session.execute(
-                select(TenantAnswerEvidence).where(
-                    TenantAnswerEvidence.tenant_id == ctx.tenant_id,
-                    TenantAnswerEvidence.answer_id.in_(ans_ids),
-                )
-            ).scalars().all()
-
-        ev_ids = sorted({l.evidence_id for l in links})
-
-        answer_to_evidence: dict[uuid.UUID, list[uuid.UUID]] = {}
-        for l in links:
-            answer_to_evidence.setdefault(l.answer_id, []).append(l.evidence_id)
-        evidences = []
-        if ev_ids:
-            evidences = session.execute(
-                select(EvidenceItem).where(
-                    EvidenceItem.tenant_id == ctx.tenant_id,
-                    EvidenceItem.id.in_(ev_ids),
-                )
-            ).scalars().all()
 
         pack = {
             "template": {
-                "code": tpl.code,
-                "name": tpl.name,
-                "version": tpl.version,
-                "language": tpl.language,
+                "code": tpl["code"],
+                "name": tpl["name"],
+                "version": tpl.get("version"),
+                "language": tpl.get("language"),
             },
             "tenant_id": str(ctx.tenant_id),
             "generated_at": datetime.utcnow().isoformat(),
-            "answers": [
-                {
-                    "question_key": qmap[a.question_id].key,
-                    "question_prompt": qmap[a.question_id].prompt,
-                    "answer_text": a.answer_text,
-                    "updated_at": a.updated_at.isoformat(),
-                    "evidence_ids": [str(eid) for eid in sorted(answer_to_evidence.get(a.id, []))],
-                }
-                for a in sorted(answers, key=lambda x: qmap[x.question_id].key)
-            ],
-            "evidence": [
-                {
-                    "id": str(e.id),
-                    "title": e.title,
-                    "description": e.description,
-                    "original_filename": e.original_filename,
-                    "uploaded_at": e.uploaded_at.isoformat() if e.uploaded_at else None,
-                    "storage_key": e.storage_key,
-                    "content_hash": e.content_hash,
-                }
-                for e in sorted(evidences, key=lambda x: x.created_at, reverse=True)
-            ],
+            "answers": answers_out,
+            "evidence": ev_out,
         }
-
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            z.writestr("pack.json", json.dumps(pack, indent=2))
-        buf.seek(0)
-
-        write_audit(
-            db=session,
-            tenant_id=ctx.tenant_id,
-            actor_user_id=ctx.user_id,
-            action="pack.export",
-            object_type="template",
-            object_id=tpl.code,
-            meta={},
-        )
-        session.commit()
-
-    filename = f"{template_code}_pack.zip"
-    return StreamingResponse(
-        buf,
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
-
-@router.get("/status/{template_code}")
-def pack_status(template_code: str, ctx: TenantContext = Depends(get_ctx)) -> dict:
-    with SessionLocal() as session:
-        tpl = session.execute(
-            select(QuestionnaireTemplate).where(QuestionnaireTemplate.code == template_code)
-        ).scalar_one_or_none()
-        if tpl is None:
-            raise HTTPException(status_code=404, detail="template not found")
-
-        questions = session.execute(
-            select(QuestionnaireQuestion)
-            .where(QuestionnaireQuestion.template_id == tpl.id)
-            .order_by(QuestionnaireQuestion.key.asc())
-        ).scalars().all()
-
-        q_by_id = {q.id: q for q in questions}
-        qids = list(q_by_id.keys())
-
-        answers = []
-        if qids:
-            answers = session.execute(
-                select(TenantAnswer).where(
-                    TenantAnswer.tenant_id == ctx.tenant_id,
-                    TenantAnswer.question_id.in_(qids),
-                )
-            ).scalars().all()
-
-        answered_qids = {a.question_id for a in answers}
-        unanswered = [q_by_id[qid].key for qid in qids if qid not in answered_qids]
-
-        ans_ids = [a.id for a in answers]
-        links = []
-        if ans_ids:
-            links = session.execute(
-                select(TenantAnswerEvidence).where(
-                    TenantAnswerEvidence.tenant_id == ctx.tenant_id,
-                    TenantAnswerEvidence.answer_id.in_(ans_ids),
-                )
-            ).scalars().all()
-
-        evidence_by_answer: dict[uuid.UUID, int] = {}
-        for l in links:
-            evidence_by_answer[l.answer_id] = evidence_by_answer.get(l.answer_id, 0) + 1
-
-        answers_missing_evidence = []
-        for a in answers:
-            if evidence_by_answer.get(a.id, 0) == 0:
-                answers_missing_evidence.append(q_by_id[a.question_id].key)
-
-        distinct_evidence_ids = sorted({l.evidence_id for l in links})
-
-        return {
-            "template_code": tpl.code,
-            "total_questions": len(questions),
-            "answered": len(answers),
-            "unanswered_keys": unanswered,
-            "answers_missing_evidence_keys": answers_missing_evidence,
-            "attached_evidence_count": len(distinct_evidence_ids),
-        }
-
-import io
-from docx import Document
-from docx.shared import Pt
-from fastapi.responses import Response
-
-
-@router.get("/export-docx/{template_code}")
-def export_pack_docx(template_code: str, ctx: TenantContext = Depends(get_ctx)):
-    with SessionLocal() as session:
-        tpl = session.execute(
-            select(QuestionnaireTemplate).where(QuestionnaireTemplate.code == template_code)
-        ).scalar_one_or_none()
-        if tpl is None:
-            raise HTTPException(status_code=404, detail="template not found")
-
-        questions = session.execute(
-            select(QuestionnaireQuestion).where(QuestionnaireQuestion.template_id == tpl.id)
-        ).scalars().all()
-        qmap = {q.id: q for q in questions}
-        qids = list(qmap.keys())
-
-        answers = []
-        if qids:
-            answers = session.execute(
-                select(TenantAnswer).where(
-                    TenantAnswer.tenant_id == ctx.tenant_id,
-                    TenantAnswer.question_id.in_(qids),
-                )
-            ).scalars().all()
-
-        ans_ids = [a.id for a in answers]
-        links = []
-        if ans_ids:
-            links = session.execute(
-                select(TenantAnswerEvidence).where(
-                    TenantAnswerEvidence.tenant_id == ctx.tenant_id,
-                    TenantAnswerEvidence.answer_id.in_(ans_ids),
-                )
-            ).scalars().all()
-
-        answer_to_evidence: dict[uuid.UUID, list[uuid.UUID]] = {}
-        for l in links:
-            answer_to_evidence.setdefault(l.answer_id, []).append(l.evidence_id)
-
-        ev_ids = sorted({l.evidence_id for l in links})
-        evidences = []
-        if ev_ids:
-            evidences = session.execute(
-                select(EvidenceItem).where(
-                    EvidenceItem.tenant_id == ctx.tenant_id,
-                    EvidenceItem.id.in_(ev_ids),
-                )
-            ).scalars().all()
-
-        doc = Document()
-        title = doc.add_heading(f"{tpl.name} — Security Pack", level=0)
-        if title.runs:
-            title.runs[0].font.size = Pt(20)
-
-        doc.add_paragraph(f"Template: {tpl.code} ({tpl.version}, {tpl.language})")
-        doc.add_paragraph(f"Tenant ID: {ctx.tenant_id}")
-        doc.add_paragraph(f"Generated at (UTC): {datetime.utcnow().isoformat()}")
-
-        doc.add_paragraph("")
-        doc.add_heading("Answers", level=1)
-
-        table = doc.add_table(rows=1, cols=4)
-        hdr = table.rows[0].cells
-        hdr[0].text = "Question"
-        hdr[1].text = "Answer"
-        hdr[2].text = "Updated (UTC)"
-        hdr[3].text = "Evidence IDs"
-
-        for a in sorted(answers, key=lambda x: qmap[x.question_id].key):
-            q = qmap[a.question_id]
-            ev_list = [str(eid) for eid in sorted(answer_to_evidence.get(a.id, []))]
-            row = table.add_row().cells
-            row[0].text = f"{q.key}\n{q.prompt}"
-            row[1].text = a.answer_text
-            row[2].text = a.updated_at.isoformat()
-            row[3].text = "\n".join(ev_list) if ev_list else ""
-
-        doc.add_paragraph("")
-        doc.add_heading("Evidence Inventory", level=1)
-
-        ev_table = doc.add_table(rows=1, cols=6)
-        eh = ev_table.rows[0].cells
-        eh[0].text = "Evidence ID"
-        eh[1].text = "Title"
-        eh[2].text = "Original filename"
-        eh[3].text = "Uploaded at (UTC)"
-        eh[4].text = "Content hash"
-        eh[5].text = "Storage key"
-
-        for e in sorted(evidences, key=lambda x: x.created_at, reverse=True):
-            row = ev_table.add_row().cells
-            row[0].text = str(e.id)
-            row[1].text = e.title or ""
-            row[2].text = e.original_filename or ""
-            row[3].text = e.uploaded_at.isoformat() if e.uploaded_at else ""
-            row[4].text = e.content_hash or ""
-            row[5].text = e.storage_key or ""
-
-        buf = io.BytesIO()
-        doc.save(buf)
-        data = buf.getvalue()
-
-        write_audit(
-            db=session,
-            tenant_id=ctx.tenant_id,
-            actor_user_id=ctx.user_id,
-            action="pack.export_docx",
-            object_type="template",
-            object_id=tpl.code,
-            meta={},
-        )
-        session.commit()
-
-    filename = f"{template_code}_pack.docx"
-    return Response(
-        content=data,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
-
-def render_docx_bytes(pack: dict) -> bytes:
-    # Minimal DOCX generator used by /passport export.
-    from io import BytesIO
-    doc = Document()
-
-    tpl = (pack or {}).get('template') or {}
-    doc.add_heading('Security Passport', level=0)
-    doc.add_paragraph(f"Template: {tpl.get('name','')} ({tpl.get('code','')})")
-    doc.add_paragraph(f"Version: {tpl.get('version','')}  Language: {tpl.get('language','')}")
-    doc.add_paragraph(f"Tenant: {pack.get('tenant_id','')}")
-    doc.add_paragraph(f"Generated at: {pack.get('generated_at','')}")
-
-    doc.add_heading('Answers', level=1)
-    answers = (pack or {}).get('answers') or []
-    if not answers:
-        doc.add_paragraph('No answers yet.')
-    else:
-        for a in answers:
-            doc.add_heading(a.get('question_key') or 'question', level=2)
-            if a.get('question_prompt'):
-                doc.add_paragraph(a['question_prompt'])
-            doc.add_paragraph(a.get('answer_text') or '')
-            ev_ids = a.get('evidence_ids') or []
-            if ev_ids:
-                doc.add_paragraph('Evidence IDs: ' + ', '.join(ev_ids))
-
-    doc.add_heading('Evidence', level=1)
-    evidence = (pack or {}).get('evidence') or []
-    if not evidence:
-        doc.add_paragraph('No evidence attached.')
-    else:
-        for ev in evidence:
-            doc.add_heading(ev.get('title') or ev.get('id') or 'evidence', level=2)
-            if ev.get('description'):
-                doc.add_paragraph(ev['description'])
-            doc.add_paragraph(f"Original filename: {ev.get('original_filename')}")
-            doc.add_paragraph(f"Uploaded at: {ev.get('uploaded_at')}")
-            doc.add_paragraph(f"Content hash: {ev.get('content_hash')}")
-            doc.add_paragraph(f"Storage key: {ev.get('storage_key')}")
-
-    buf = BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
+        return pack
