@@ -1,261 +1,233 @@
 import io
 import json
 import zipfile
-import traceback
 from datetime import datetime
 from typing import Any, Dict, List
 
 import httpx
-import sqlalchemy as sa
-from docx import Document
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 
 from app.core.auth import TenantContext, get_ctx
 from app.db.session import SessionLocal
+from app.models.core import EvidenceItem
 from app.api.evidence import get_download_url
 router = APIRouter(prefix="/passport", tags=["passport"])
 
 
-def _render_docx_bytes(pack: Dict[str, Any]) -> bytes:
+def _build_pack_via_db(session, ctx, template_code: str) -> dict:
     """
-    Self-contained DOCX renderer.
-    Avoids importing anything from questionnaires.py to prevent import/name drift.
+    Build the passport pack using DB reflection (no ORM model imports).
+    This avoids breakage if model class names differ.
     """
-    from io import BytesIO
+    import sqlalchemy as sa
 
-    doc = Document()
-
-    tpl = (pack or {}).get("template") or {}
-    doc.add_heading("Security Passport", level=0)
-    doc.add_paragraph(f"Template: {tpl.get('name','')} ({tpl.get('code','')})")
-    doc.add_paragraph(f"Version: {tpl.get('version','')}  Language: {tpl.get('language','')}")
-    doc.add_paragraph(f"Tenant ID: {pack.get('tenant_id','')}")
-    doc.add_paragraph(f"Generated at (UTC): {pack.get('generated_at','')}")
-
-    doc.add_paragraph("")
-
-    doc.add_heading("Answers", level=1)
-    answers = pack.get("answers") or []
-    for a in answers:
-        doc.add_heading(a.get("question_key") or "question", level=2)
-        doc.add_paragraph(a.get("question_prompt") or "")
-        doc.add_paragraph(a.get("answer_text") or "", style=None)
-        ev_ids = a.get("evidence_ids") or []
-        if ev_ids:
-            doc.add_paragraph("Evidence IDs: " + ", ".join(ev_ids))
-        updated_at = a.get("updated_at")
-        if updated_at:
-            doc.add_paragraph(f"Updated at: {updated_at}")
-
-    evidence = pack.get("evidence") or []
-    if evidence:
-        doc.add_page_break()
-        doc.add_heading("Evidence", level=1)
-        for e in evidence:
-            doc.add_heading(e.get("title") or e.get("id") or "evidence", level=2)
-            if e.get("description"):
-                doc.add_paragraph(e["description"])
-            doc.add_paragraph(f"Original filename: {e.get('original_filename')}")
-            doc.add_paragraph(f"Uploaded at: {e.get('uploaded_at')}")
-            doc.add_paragraph(f"Content hash: {e.get('content_hash')}")
-            doc.add_paragraph(f"Storage key: {e.get('storage_key')}")
-
-    bio = BytesIO()
-    doc.save(bio)
-    return bio.getvalue()
-
-
-def _build_pack_via_db(session, ctx: TenantContext, template_code: str) -> dict:
-    """
-    Build passport pack via DB reflection (no ORM imports).
-    Assumes your schema:
-      - questionnaire_templates
-      - questionnaire_questions
-      - tenant_answers
-      - tenant_answer_evidence (optional)
-      - evidence_items
-    """
     md = sa.MetaData()
     bind = session.get_bind()
     insp = sa.inspect(bind)
-    existing = set(insp.get_table_names())
 
-    def table(name: str) -> sa.Table:
-        if name not in existing:
-            raise RuntimeError(f"Missing table '{name}'. Existing: {sorted(existing)}")
-        return sa.Table(name, md, autoload_with=bind)
+    def pick_table(*candidates: str) -> str:
+        existing = set(insp.get_table_names())
+        for name in candidates:
+            if name in existing:
+                return name
+        raise RuntimeError(f"None of the table candidates exist: {candidates}. Existing: {sorted(existing)}")
 
-    t_templates = table("questionnaire_templates")
-    t_questions = table("questionnaire_questions")
-    t_answers = table("tenant_answers")
-    t_evidence = table("evidence_items")
+    # Try common naming variants
+    t = sa.Table(
+        pick_table("questionnaire_templates", "questionnaires_templates", "questionnaire_template"),
+        md, autoload_with=bind,
+    )
+    q = sa.Table(
+        pick_table("questionnaire_questions", "questionnaires_questions", "questionnaire_question"),
+        md, autoload_with=bind,
+    )
+    a = sa.Table(
+        pick_table(
+            "tenant_answers",
+            "questionnaire_answers",
+            "questionnaire_answer",
+            "questionnaire_question_answers",
+            "questionnaire_responses",
+        ),
+        md, autoload_with=bind,
+    )
 
-    t_answer_evidence = table("tenant_answer_evidence") if "tenant_answer_evidence" in existing else None
+    # Answer-evidence link table is optional depending on phase
+    ae_name = None
+    for cand in (
+        "tenant_answer_evidence",
+        "questionnaire_answer_evidence",
+        "questionnaire_answer_evidences",
+        "questionnaire_answers_evidence",
+        "questionnaire_answers_evidences",
+        "questionnaire_answer_evidence_links",
+    ):
+        if cand in insp.get_table_names():
+            ae_name = cand
+            break
+    ae = sa.Table(ae_name, md, autoload_with=bind) if ae_name else None
 
-    # template row
-    tpl = session.execute(
-        sa.select(t_templates).where(t_templates.c.code == template_code)
+
+    # Evidence table (we know this one from your schema)
+    e = sa.Table("evidence_items", md, autoload_with=bind)
+
+    # Fetch template
+    tpl_row = session.execute(
+        sa.select(t).where(sa.and_(t.c.code == template_code))
     ).mappings().first()
-    if not tpl:
-        raise HTTPException(status_code=404, detail=f"Unknown template: {template_code}")
+    if not tpl_row:
+        raise ValueError(f"Unknown template: {template_code}")
 
-    # questions for template
-    questions = session.execute(
-        sa.select(t_questions)
-        .where(t_questions.c.template_id == tpl["id"])
-        .order_by(t_questions.c.key.asc())
-    ).mappings().all()
-
-    q_ids = [q["id"] for q in questions if q.get("id") is not None]
-    q_keys = [q.get("key") for q in questions if q.get("key")]
-
-    # answers for tenant limited to template questions
-    where_parts = [t_answers.c.tenant_id == ctx.tenant_id]
-
-    if "question_id" in t_answers.c and q_ids:
-        where_parts.append(t_answers.c.question_id.in_(q_ids))
-    elif "question_key" in t_answers.c and q_keys:
-        where_parts.append(t_answers.c.question_key.in_(q_keys))
-    else:
-        raise RuntimeError("tenant_answers must have question_id or question_key to link to questions")
-
-    ans_rows = session.execute(
-        sa.select(t_answers).where(sa.and_(*where_parts))
-    ).mappings().all()
-
-    by_qid: Dict[Any, Dict[str, Any]] = {}
-    by_key: Dict[str, Dict[str, Any]] = {}
-    for a in ans_rows:
-        if "question_id" in a and a.get("question_id") is not None:
-            by_qid[a["question_id"]] = a
-        if "question_key" in a and a.get("question_key"):
-            by_key[a["question_key"]] = a
-
-    # evidence links
-    ev_ids_by_answer: Dict[str, List[str]] = {}
-    if t_answer_evidence is not None:
-        link_rows = session.execute(
-            sa.select(t_answer_evidence).where(t_answer_evidence.c.tenant_id == ctx.tenant_id)
-        ).mappings().all()
-        for lr in link_rows:
-            ev_ids_by_answer.setdefault(str(lr["answer_id"]), []).append(str(lr["evidence_id"]))
-
-    pack: Dict[str, Any] = {
+    pack = {
         "template": {
-            "code": tpl.get("code"),
-            "name": tpl.get("name"),
-            "version": tpl.get("version"),
-            "language": tpl.get("language"),
+            "code": tpl_row.get("code"),
+            "name": tpl_row.get("name"),
+            "version": tpl_row.get("version"),
+            "language": tpl_row.get("language"),
         },
         "tenant_id": str(ctx.tenant_id),
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": __import__("datetime").datetime.utcnow().isoformat(),
         "answers": [],
         "evidence": [],
     }
 
-    all_ev_ids: set[str] = set()
+    # Get question list for prompts/keys
+    questions = session.execute(
+        sa.select(q).where(q.c.template_id == tpl_row["id"]).order_by(q.c.key.asc())
+    ).mappings().all()
 
-    for q in questions:
+    # Pull answers for this tenant/template
+    # NOTE: depending on your schema, answers table may store question_id OR question_key.
+    # We'll support both.
+    answers_rows = session.execute(
+        sa.select(a).where(
+            sa.and_(
+                a.c.tenant_id == ctx.tenant_id,
+                sa.or_(
+                    getattr(a.c, "template_id", None) == tpl_row["id"] if "template_id" in a.c else sa.true(),
+                    sa.true(),
+                ),
+            )
+        )
+    ).mappings().all()
+
+    # Index answers by question_id or key
+    by_qid = {}
+    by_key = {}
+    for r in answers_rows:
+        if "question_id" in r and r["question_id"] is not None:
+            by_qid[r["question_id"]] = r
+        if "question_key" in r and r["question_key"]:
+            by_key[r["question_key"]] = r
+
+    # Evidence links by answer_id (if link table exists)
+    ev_ids_by_answer = {}
+    if ae is not None:
+        link_rows = session.execute(
+            sa.select(ae).where(ae.c.tenant_id == ctx.tenant_id)
+        ).mappings().all()
+        for lr in link_rows:
+            ev_ids_by_answer.setdefault(lr["answer_id"], []).append(lr["evidence_id"])
+
+    # Collect evidence ids to include and build answer payloads
+    all_ev_ids = set()
+
+    for qu in questions:
         ans = None
-        if q.get("id") in by_qid:
-            ans = by_qid[q["id"]]
-        elif q.get("key") in by_key:
-            ans = by_key[q["key"]]
+        if "id" in qu and qu["id"] in by_qid:
+            ans = by_qid[qu["id"]]
+        elif qu.get("key") in by_key:
+            ans = by_key[qu["key"]]
 
         if not ans:
             continue
 
-        updated = ans.get("updated_at") or ans.get("created_at")
-        if updated is not None and hasattr(updated, "isoformat"):
-            updated = updated.isoformat()
-
-        item: Dict[str, Any] = {
-            "question_key": q.get("key"),
-            "question_prompt": q.get("prompt"),
+        item = {
+            "question_key": qu.get("key"),
+            "question_prompt": qu.get("prompt"),
             "answer_text": ans.get("answer_text"),
-            "updated_at": updated,
+            "updated_at": (ans.get("updated_at") or ans.get("created_at") or None),
         }
 
-        ans_id = ans.get("id")
-        if ans_id is not None:
-            ev_ids = ev_ids_by_answer.get(str(ans_id), [])
-            if ev_ids:
-                item["evidence_ids"] = ev_ids
-                all_ev_ids.update(ev_ids)
+        # Attach evidence ids if possible
+        ev_ids = ev_ids_by_answer.get(ans.get("id"), [])
+        if ev_ids:
+            ev_strs = [str(x) for x in ev_ids]
+            item["evidence_ids"] = ev_strs
+            all_ev_ids.update(ev_strs)
+
+        # normalize timestamps to isoformat
+        if item["updated_at"] is not None and hasattr(item["updated_at"], "isoformat"):
+            item["updated_at"] = item["updated_at"].isoformat()
 
         pack["answers"].append(item)
 
-    # evidence metadata
+    # Evidence metadata section
     if all_ev_ids:
         ev_rows = session.execute(
-            sa.select(t_evidence).where(
-                sa.and_(
-                    t_evidence.c.tenant_id == ctx.tenant_id,
-                    t_evidence.c.id.in_(list(all_ev_ids)),
-                )
-            )
+            sa.select(e).where(sa.and_(e.c.tenant_id == ctx.tenant_id, e.c.id.in_(list(all_ev_ids))))
         ).mappings().all()
 
-        for ev in ev_rows:
-            pack["evidence"].append(
-                {
-                    "id": str(ev["id"]),
-                    "title": ev.get("title"),
-                    "description": ev.get("description"),
-                    "original_filename": ev.get("original_filename"),
-                    "uploaded_at": ev.get("uploaded_at").isoformat() if ev.get("uploaded_at") else None,
-                    "storage_key": ev.get("storage_key"),
-                    "content_hash": ev.get("content_hash"),
-                }
-            )
+        for er in ev_rows:
+            ev_item = {
+                "id": str(er["id"]),
+                "title": er.get("title"),
+                "description": er.get("description"),
+                "original_filename": er.get("original_filename"),
+                "uploaded_at": er.get("uploaded_at").isoformat() if er.get("uploaded_at") else None,
+                "storage_key": er.get("storage_key"),
+                "content_hash": er.get("content_hash"),
+            }
+            pack["evidence"].append(ev_item)
 
     return pack
+
+def _render_docx_bytes(pack: Dict[str, Any]) -> bytes:
+    """
+    Use your existing DOCX renderer (Phase 6/7).
+    """
+    from app.api.questionnaires import render_docx_bytes
+    return render_docx_bytes(pack)
 
 
 @router.get("/{template_code}.zip")
 def export_passport_zip(template_code: str, ctx: TenantContext = Depends(get_ctx)):
-    try:
-        with SessionLocal() as session:
-            pack = _build_pack_via_db(session=session, ctx=ctx, template_code=template_code)
-            docx_bytes = _render_docx_bytes(pack)
+    with SessionLocal() as session:
+        pack = _build_pack_via_db(session=session, ctx=ctx, template_code=template_code)
+        docx_bytes = _render_docx_bytes(pack)
 
-            evidence_items: List[Dict[str, Any]] = pack.get("evidence", []) or []
+        evidence_items: List[Dict[str, Any]] = pack.get("evidence", []) or []
 
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                z.writestr("pack.json", json.dumps(pack, indent=2, ensure_ascii=False))
-                z.writestr("security_passport.docx", docx_bytes)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr("pack.json", json.dumps(pack, indent=2, ensure_ascii=False))
+            z.writestr("security_passport.docx", docx_bytes)
 
-                if evidence_items:
-                    z.writestr("evidence/README.txt", "Evidence files attached to answers.\n")
+            if evidence_items:
+                z.writestr("evidence/README.txt", "Evidence files attached to answers.\n")
 
-                with httpx.Client(timeout=30.0) as client:
-                    for ev in evidence_items:
-                        storage_key = ev.get("storage_key")
-                        if not storage_key:
-                            continue
+            with httpx.Client(timeout=30.0) as client:
+                for ev in evidence_items:
+                    if not ev.get("storage_key"):
+                        continue
 
-                        dl = get_download_url(storage_key)
-                        url = dl["url"]
+                    dl = get_download_url(ev["storage_key"])
+                    url = dl["url"]
 
-                        name = ev.get("original_filename") or f"{ev['id']}.bin"
-                        safe_name = name.replace("/", "_").replace("\\", "_")
-                        path_in_zip = f"evidence/{safe_name}"
+                    name = ev.get("original_filename") or f"{ev['id']}.bin"
+                    safe_name = name.replace("/", "_").replace("\\", "_")
+                    path_in_zip = f"evidence/{safe_name}"
 
-                        r = client.get(url)
-                        r.raise_for_status()
-                        z.writestr(path_in_zip, r.content)
+                    r = client.get(url)
+                    r.raise_for_status()
+                    z.writestr(path_in_zip, r.content)
 
-            buf.seek(0)
-            filename = f"{template_code}_passport_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
-            return StreamingResponse(
-                buf,
-                media_type="application/zip",
-                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        # dev-friendly: return traceback in response so you can see the real failure in curl
-        raise HTTPException(status_code=500, detail=traceback.format_exc())
+        buf.seek(0)
+        filename = f"{template_code}_passport_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+        return StreamingResponse(
+            buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'},
+        )
