@@ -22,6 +22,9 @@ from app.api.passport import router as passport_router
 from app.api.questionnaires import router as questionnaires_router
 from app.api.health import router as health_router
 from app.core.queue import get_redis
+from app.api.audit import router as audit_router
+from app.api.activity import router as activity_router
+
 
 app = FastAPI(title="securitypassport")
 
@@ -123,3 +126,7 @@ app.include_router(passport_router)
 
 app.include_router(questionnaires_router)
 app.include_router(health_router)
+app.include_router(audit_router)
+app.include_router(activity_router)
+
+
