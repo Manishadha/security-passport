@@ -13,6 +13,8 @@ from fastapi.responses import StreamingResponse
 from app.api.evidence import get_download_url
 from app.core.auth import TenantContext, get_ctx
 from app.db.session import SessionLocal
+from app.core.tenant_overrides import get_overrides
+
 
 router = APIRouter(prefix="/passport", tags=["passport"])
 
@@ -171,6 +173,20 @@ def _build_pack_via_db(session, ctx, template_code: str) -> dict:
             )
 
     return pack
+def _apply_passport_overrides(pack: Dict[str, Any], overrides: Dict[str, Any], include_key: str) -> Dict[str, Any]:
+    include_evidence = overrides.get(include_key, True)
+    if include_evidence:
+        return pack
+
+    pack = dict(pack)
+    pack["evidence"] = []
+    answers = []
+    for a in (pack.get("answers") or []):
+        a2 = dict(a)
+        a2.pop("evidence_ids", None)
+        answers.append(a2)
+    pack["answers"] = answers
+    return pack
 
 
 def _render_docx_bytes(pack: Dict[str, Any]) -> bytes:
@@ -182,7 +198,9 @@ def _render_docx_bytes(pack: Dict[str, Any]) -> bytes:
 @router.get("/{template_code}.docx")
 def export_passport_docx(template_code: str, ctx: TenantContext = Depends(get_ctx)):
     with SessionLocal() as session:
+        overrides = get_overrides(session, ctx.tenant_id)
         pack = _build_pack_via_db(session=session, ctx=ctx, template_code=template_code)
+        pack = _apply_passport_overrides(pack, overrides, "passport_docx_include_evidence")
         docx_bytes = _render_docx_bytes(pack)
 
     buf = io.BytesIO(docx_bytes)
@@ -194,10 +212,13 @@ def export_passport_docx(template_code: str, ctx: TenantContext = Depends(get_ct
     )
 
 
+
 @router.get("/{template_code}.zip")
 def export_passport_zip(template_code: str, ctx: TenantContext = Depends(get_ctx)):
     with SessionLocal() as session:
+        overrides = get_overrides(session, ctx.tenant_id)
         pack = _build_pack_via_db(session=session, ctx=ctx, template_code=template_code)
+        pack = _apply_passport_overrides(pack, overrides, "passport_zip_include_evidence")
         docx_bytes = _render_docx_bytes(pack)
 
         evidence_items: List[Dict[str, Any]] = pack.get("evidence", []) or []
@@ -214,35 +235,32 @@ def export_passport_zip(template_code: str, ctx: TenantContext = Depends(get_ctx
                 z.writestr("evidence/README.txt", "Evidence files attached to answers.\n")
                 z.writestr("evidence/_meta.txt", f"count={len(evidence_items)}\n")
 
+                with httpx.Client(timeout=30.0) as client:
+                    for ev in evidence_items:
+                        storage_key = ev.get("storage_key")
+                        if not storage_key:
+                            failures.append(f"{ev.get('id','')} missing_storage_key")
+                            continue
 
-            with httpx.Client(timeout=30.0) as client:
-                for ev in evidence_items:
-                    storage_key = ev.get("storage_key")
-                    if not storage_key:
-                        failures.append(f"{ev.get('id','')} missing_storage_key")
-                        continue
+                        name = _safe_zip_name(ev.get("original_filename") or "", f"{ev['id']}.bin")
+                        path_in_zip = f"evidence/files/{name}"
 
-                    name = _safe_zip_name(ev.get("original_filename") or "", f"{ev['id']}.bin")
-                    path_in_zip = f"evidence/files/{name}"
+                        try:
+                            dl = get_download_url(storage_key)
+                            url = dl["url"]
 
+                            with client.stream("GET", url) as r:
+                                r.raise_for_status()
+                                with z.open(path_in_zip, "w") as w:
+                                    for chunk in r.iter_bytes():
+                                        w.write(chunk)
 
-                    try:
-                        dl = get_download_url(storage_key)
-                        url = dl["url"]
+                            downloaded += 1
+                        except Exception as ex:
+                            failures.append(f"{ev.get('id','')} {name} {type(ex).__name__}")
 
-                        with client.stream("GET", url) as r:
-                            r.raise_for_status()
-                            with z.open(path_in_zip, "w") as w:
-                                for chunk in r.iter_bytes():
-                                    w.write(chunk)
-
-                        downloaded += 1
-                    except Exception as ex:
-                        failures.append(f"{ev.get('id','')} {name} {type(ex).__name__}")
-
-            if failures:
-                z.writestr("evidence/_FAILED_DOWNLOADS.txt", "\n".join(failures) + "\n")
-
+                if failures:
+                    z.writestr("evidence/_FAILED_DOWNLOADS.txt", "\n".join(failures) + "\n")
 
         buf.seek(0)
         filename = f"{template_code}_passport_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
@@ -251,3 +269,4 @@ def export_passport_zip(template_code: str, ctx: TenantContext = Depends(get_ctx
             media_type="application/zip",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+

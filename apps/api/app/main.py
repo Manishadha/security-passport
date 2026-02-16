@@ -24,6 +24,8 @@ from app.api.health import router as health_router
 from app.core.queue import get_redis
 from app.api.audit import router as audit_router
 from app.api.activity import router as activity_router
+from app.api.tenant_settings import router as tenant_settings_router
+from app.api.tenant_overrides import router as tenant_overrides_router
 
 
 app = FastAPI(title="securitypassport")
@@ -128,5 +130,7 @@ app.include_router(questionnaires_router)
 app.include_router(health_router)
 app.include_router(audit_router)
 app.include_router(activity_router)
+app.include_router(tenant_settings_router)
+app.include_router(tenant_overrides_router)
 
 
