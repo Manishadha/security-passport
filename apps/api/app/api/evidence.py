@@ -1,4 +1,3 @@
-import boto3
 import hashlib
 import uuid
 from datetime import datetime
@@ -8,40 +7,24 @@ from sqlalchemy import select
 
 from app.core.auth import TenantContext, get_ctx
 from app.core.audit import write_audit
-from app.core.storage import s3_client
 from app.core.settings import settings
+from app.core.storage import s3_client
 from app.db.session import SessionLocal
 from app.models.core import EvidenceItem
 
 
 def get_download_url(storage_key: str) -> dict:
-    import os
-
-    endpoint = os.getenv("S3_ENDPOINT")
-    access_key = os.getenv("S3_ACCESS_KEY")
-    secret_key = os.getenv("S3_SECRET_KEY")
-    bucket = os.getenv("S3_BUCKET")
-    region = os.getenv("S3_REGION") or "us-east-1"
-
-    if not endpoint or not access_key or not secret_key or not bucket:
-        raise RuntimeError("S3 env is not configured")
-
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-        region_name=region,
-    )
-
+    s3 = s3_client()
     url = s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": bucket, "Key": storage_key},
+        ClientMethod="get_object",
+        Params={"Bucket": settings.s3_bucket, "Key": storage_key},
         ExpiresIn=300,
     )
     return {"url": url, "expires_in_seconds": 300}
 
+
 router = APIRouter(prefix="/evidence", tags=["evidence"])
+
 
 @router.post("")
 def create_evidence(payload: dict, ctx: TenantContext = Depends(get_ctx)) -> dict:
@@ -73,6 +56,7 @@ def create_evidence(payload: dict, ctx: TenantContext = Depends(get_ctx)) -> dic
 
         return {"id": str(item.id)}
 
+
 @router.get("")
 def list_evidence(ctx: TenantContext = Depends(get_ctx)) -> list[dict]:
     with SessionLocal() as session:
@@ -89,10 +73,10 @@ def list_evidence(ctx: TenantContext = Depends(get_ctx)) -> list[dict]:
                 "storage_key": r.storage_key,
                 "original_filename": r.original_filename,
                 "uploaded_at": r.uploaded_at.isoformat() if r.uploaded_at else None,
-
             }
             for r in rows
         ]
+
 
 @router.post("/{evidence_id}/upload")
 async def upload_file(evidence_id: str, file: UploadFile = File(...), ctx: TenantContext = Depends(get_ctx)) -> dict:
@@ -140,6 +124,7 @@ async def upload_file(evidence_id: str, file: UploadFile = File(...), ctx: Tenan
 
     return {"status": "ok", "storage_key": storage_key}
 
+
 @router.get("/{evidence_id}/download")
 def download_file(evidence_id: str, ctx: TenantContext = Depends(get_ctx)) -> dict:
     eid = uuid.UUID(evidence_id)
@@ -157,7 +142,7 @@ def download_file(evidence_id: str, ctx: TenantContext = Depends(get_ctx)) -> di
         Params={
             "Bucket": settings.s3_bucket,
             "Key": item.storage_key,
-            "ResponseContentDisposition": f'attachment; filename="{eid}.bin"',
+            "ResponseContentDisposition": f'attachment; filename="{item.original_filename or (str(eid) + ".bin")}"',
             "ResponseContentType": item.content_type or "application/octet-stream",
         },
         ExpiresIn=300,

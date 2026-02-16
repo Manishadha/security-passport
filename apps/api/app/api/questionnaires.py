@@ -1,17 +1,11 @@
-import io
-import json
 import uuid
-import zipfile
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.core.auth import TenantContext, get_ctx
-from app.core.audit import write_audit
 from app.db.session import SessionLocal
-from app.models.core import EvidenceItem
 
 router = APIRouter(prefix="/questionnaires", tags=["questionnaires"])
 
@@ -44,9 +38,7 @@ def list_templates() -> list[dict]:
 
     with SessionLocal() as session:
         _, _, tpls, _, _, _ = _q_tables(session)
-        rows = session.execute(
-            sa.select(tpls).order_by(tpls.c.created_at.desc())
-        ).mappings().all()
+        rows = session.execute(sa.select(tpls).order_by(tpls.c.created_at.desc())).mappings().all()
 
         return [
             {
@@ -68,16 +60,12 @@ def get_template(template_id: str) -> dict:
     with SessionLocal() as session:
         _, _, tpls, qs, _, _ = _q_tables(session)
 
-        tpl = session.execute(
-            sa.select(tpls).where(tpls.c.id == tid)
-        ).mappings().first()
+        tpl = session.execute(sa.select(tpls).where(tpls.c.id == tid)).mappings().first()
         if tpl is None:
             raise HTTPException(status_code=404, detail="not found")
 
         qrows = session.execute(
-            sa.select(qs)
-            .where(qs.c.template_id == tpl["id"])
-            .order_by(qs.c.key.asc())
+            sa.select(qs).where(qs.c.template_id == tpl["id"]).order_by(qs.c.key.asc())
         ).mappings().all()
 
         return {
@@ -104,11 +92,9 @@ def upsert_answer(
         raise HTTPException(status_code=400, detail="answer_text required")
 
     with SessionLocal() as session:
-        _, bind, _, qs, ans, _ = _q_tables(session)
+        _, _, _, qs, ans, _ = _q_tables(session)
 
-        qrow = session.execute(
-            sa.select(qs).where(qs.c.id == qid)
-        ).mappings().first()
+        qrow = session.execute(sa.select(qs).where(qs.c.id == qid)).mappings().first()
         if qrow is None:
             raise HTTPException(status_code=404, detail="question not found")
 
@@ -126,21 +112,23 @@ def upsert_answer(
                 answer_text=answer_text,
                 updated_at=now,
             ).returning(ans.c.id)
-            new_id = session.execute(ins).scalar_one()
+            answer_id = session.execute(ins).scalar_one()
             action = "answer.create"
-            answer_id = new_id
         else:
-            upd = ans.update().where(ans.c.id == existing["id"]).values(
-                answer_text=answer_text,
-                updated_at=now,
-            )
+            upd = ans.update().where(ans.c.id == existing["id"]).values(answer_text=answer_text, updated_at=now)
             session.execute(upd)
-            action = "answer.update"
             answer_id = existing["id"]
+            action = "answer.update"
 
         session.commit()
 
-        write_audit(session, ctx, action, {"question_id": str(qid), "answer_id": str(answer_id)})
+        try:
+            from app.core.audit import write_audit as _write_audit
+
+            _write_audit(session=session, ctx=ctx, action=action, meta={"question_id": str(qid), "answer_id": str(answer_id)})
+        except Exception:
+            pass
+
         return {"ok": True, "answer_id": str(answer_id)}
 
 
@@ -153,125 +141,68 @@ def attach_evidence(
     import sqlalchemy as sa
 
     aid = uuid.UUID(answer_id)
+    eid = req.evidence_id
+    now = datetime.utcnow()
 
     with SessionLocal() as session:
         md, bind, _, _, ans, ae = _q_tables(session)
+        if ae is None:
+            raise HTTPException(status_code=400, detail="evidence linking not enabled")
 
         arow = session.execute(
             sa.select(ans).where(sa.and_(ans.c.id == aid, ans.c.tenant_id == ctx.tenant_id))
         ).mappings().first()
-        if arow is None:
+        if not arow:
             raise HTTPException(status_code=404, detail="answer not found")
 
+        e = sa.Table("evidence_items", md, autoload_with=bind)
         ev = session.execute(
-            sa.select(EvidenceItem).where(EvidenceItem.id == req.evidence_id, EvidenceItem.tenant_id == ctx.tenant_id)
-        ).scalar_one_or_none()
-        if ev is None:
+            sa.select(e.c.id).where(sa.and_(e.c.id == eid, e.c.tenant_id == ctx.tenant_id))
+        ).first()
+        if not ev:
             raise HTTPException(status_code=404, detail="evidence not found")
 
-        if ae is None:
-            raise HTTPException(status_code=400, detail="evidence linking not available")
+        values = {}
+        if "id" in ae.c:
+            values["id"] = uuid.uuid4()
+        if "tenant_id" in ae.c:
+            values["tenant_id"] = ctx.tenant_id
+        if "answer_id" in ae.c:
+            values["answer_id"] = aid
+        if "evidence_id" in ae.c:
+            values["evidence_id"] = eid
+        if "created_at" in ae.c:
+            values["created_at"] = now
+        if "updated_at" in ae.c:
+            values["updated_at"] = now
 
-        session.execute(
-            ae.insert().values(
-                id=uuid.uuid4(),
-                tenant_id=ctx.tenant_id,
-                answer_id=aid,
-                evidence_id=req.evidence_id,
-                created_at=datetime.utcnow(),
+        exists_q = sa.select(ae.c.id).where(
+            sa.and_(
+                ae.c.answer_id == aid,
+                ae.c.evidence_id == eid,
+                ae.c.tenant_id == ctx.tenant_id if "tenant_id" in ae.c else sa.true(),
             )
-        )
+        ).limit(1)
+
+        already = session.execute(exists_q).first() is not None
+
+        if not already:
+            session.execute(sa.insert(ae).values(**values))
+
         session.commit()
 
-        write_audit(session, ctx, "answer.attach_evidence", {"answer_id": str(aid), "evidence_id": str(req.evidence_id)})
-        return {"ok": True}
+        already_linked = already
 
+        try:
+            from app.core.audit import write_audit as _write_audit
 
-@router.get("/export-pack/{template_code}.json")
-def export_pack_json(template_code: str, ctx: TenantContext = Depends(get_ctx)):
-    import sqlalchemy as sa
-
-    with SessionLocal() as session:
-        _, _, tpls, qs, ans, ae = _q_tables(session)
-
-        tpl = session.execute(
-            sa.select(tpls).where(tpls.c.code == template_code)
-        ).mappings().first()
-        if tpl is None:
-            raise HTTPException(status_code=404, detail="unknown template")
-
-        qrows = session.execute(
-            sa.select(qs).where(qs.c.template_id == tpl["id"]).order_by(qs.c.key.asc())
-        ).mappings().all()
-
-        arows = session.execute(
-            sa.select(ans).where(sa.and_(ans.c.tenant_id == ctx.tenant_id))
-        ).mappings().all()
-
-        by_qid = {r["question_id"]: r for r in arows if r.get("question_id") is not None}
-
-        ev_ids_by_answer = {}
-        if ae is not None:
-            lrows = session.execute(
-                sa.select(ae).where(ae.c.tenant_id == ctx.tenant_id)
-            ).mappings().all()
-            for lr in lrows:
-                ev_ids_by_answer.setdefault(lr["answer_id"], []).append(lr["evidence_id"])
-
-        all_ev_ids = set()
-        answers_out = []
-
-        for q in qrows:
-            ar = by_qid.get(q["id"])
-            if not ar:
-                continue
-
-            ev_ids = ev_ids_by_answer.get(ar["id"], [])
-            ev_strs = [str(x) for x in ev_ids] if ev_ids else []
-            all_ev_ids.update(ev_strs)
-
-            updated_at = ar.get("updated_at") or ar.get("created_at")
-            if updated_at is not None and hasattr(updated_at, "isoformat"):
-                updated_at = updated_at.isoformat()
-
-            answers_out.append(
-                {
-                    "question_key": q.get("key"),
-                    "question_prompt": q.get("prompt"),
-                    "answer_text": ar.get("answer_text"),
-                    "updated_at": updated_at,
-                    "evidence_ids": ev_strs if ev_strs else None,
-                }
+            _write_audit(
+                session=session,
+                ctx=ctx,
+                action="answer.attach_evidence",
+                meta={"answer_id": str(aid), "evidence_id": str(eid), "already_linked": already_linked},
             )
+        except Exception:
+            pass
 
-        ev_out = []
-        if all_ev_ids:
-            ev_rows = session.execute(
-                sa.select(EvidenceItem).where(sa.and_(EvidenceItem.tenant_id == ctx.tenant_id, EvidenceItem.id.in_(list(all_ev_ids))))
-            ).all()
-            for (ev,) in ev_rows:
-                ev_out.append(
-                    {
-                        "id": str(ev.id),
-                        "title": ev.title,
-                        "description": ev.description,
-                        "original_filename": ev.original_filename,
-                        "uploaded_at": ev.uploaded_at.isoformat() if ev.uploaded_at else None,
-                        "storage_key": ev.storage_key,
-                        "content_hash": ev.content_hash,
-                    }
-                )
-
-        pack = {
-            "template": {
-                "code": tpl["code"],
-                "name": tpl["name"],
-                "version": tpl.get("version"),
-                "language": tpl.get("language"),
-            },
-            "tenant_id": str(ctx.tenant_id),
-            "generated_at": datetime.utcnow().isoformat(),
-            "answers": answers_out,
-            "evidence": ev_out,
-        }
-        return pack
+        return {"ok": True, "answer_id": str(aid), "evidence_id": str(eid), "already_linked": already_linked}
