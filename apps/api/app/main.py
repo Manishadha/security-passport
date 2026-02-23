@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 from pathlib import Path
-load_dotenv(Path(__file__).resolve().parents[1] / '.env', override=True)
+load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=True)
 
 from pathlib import Path
 
@@ -26,9 +26,23 @@ from app.api.audit import router as audit_router
 from app.api.activity import router as activity_router
 from app.api.tenant_settings import router as tenant_settings_router
 from app.api.tenant_overrides import router as tenant_overrides_router
+from fastapi.middleware.cors import CORSMiddleware
+
 
 
 app = FastAPI(title="securitypassport")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/health/redis")
 def health_redis() -> dict:
