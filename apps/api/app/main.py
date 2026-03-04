@@ -1,34 +1,53 @@
-from dotenv import load_dotenv
-from pathlib import Path
-load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=True)
+from __future__ import annotations
 
-from pathlib import Path
-
-import uuid
+import os
 from datetime import datetime
 
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy import text, select
+import sentry_sdk
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy import select, text
+from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY
 
-from app.api.schemas import RegisterRequest, LoginRequest, TokenResponse, MeResponse
-from app.core.auth import TenantContext, get_ctx
-from app.core.security import hash_password, verify_password, create_access_token
-from app.core.settings import settings
-from app.core.audit import write_audit
-from app.db.session import SessionLocal
-from app.models.core import Tenant, User, Membership
+from app.api.activity import router as activity_router
+from app.api.audit import router as audit_router
 from app.api.evidence import router as evidence_router
+from app.api.evidence_freshness import router as evidence_freshness_router
+from app.api.exports import router as exports_router
+from app.api.freshness import router as freshness_router
+from app.api.health import router as health_router
+from app.api.ops import router as ops_router
+from app.api.ops_config import router as ops_config_router
+from app.api.ops_extra import router as ops_extra_router
 from app.api.passport import router as passport_router
 from app.api.questionnaires import router as questionnaires_router
-from app.api.health import router as health_router
-from app.core.queue import get_redis
-from app.api.audit import router as audit_router
-from app.api.activity import router as activity_router
-from app.api.tenant_settings import router as tenant_settings_router
+from app.api.schemas import LoginRequest, MeResponse, RegisterRequest, TokenResponse
+from app.api.share_links import public_router as share_public_router
+from app.api.share_links import router as share_links_router
 from app.api.tenant_overrides import router as tenant_overrides_router
-from fastapi.middleware.cors import CORSMiddleware
+from app.api.tenant_settings import router as tenant_settings_router
+from app.api.version import router as version_router
+from app.core.audit import write_audit
+from app.core.auth import TenantContext, get_ctx
+from app.core.log_context import request_id_var
+from app.core.logging import configure_logging
+from app.core.queue import get_redis
+from app.core.rate_limit import RateLimitMiddleware, default_rate_limit_rules
+from app.core.sentry_context import SentryContextMiddleware
+from app.core.security import create_access_token, hash_password, verify_password
+from app.core.security_headers import SecurityHeadersMiddleware
+from app.core.settings import settings
+from app.core.http_middleware import RequestLoggingMiddleware
+from app.db.session import SessionLocal
+from app.models.core import Membership, Tenant, User
 
+configure_logging()
 
+dsn = os.getenv("SENTRY_DSN")
+if dsn:
+    sentry_sdk.init(dsn=dsn, traces_sample_rate=0.0)
 
 app = FastAPI(title="securitypassport")
 
@@ -37,12 +56,35 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://localhost:58000",
+        "http://127.0.0.1:58000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    rid = request.headers.get("x-request-id") or request_id_var.get()
+    headers = {"X-Request-Id": rid} if rid else None
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail, "request_id": rid}, headers=headers)
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    rid = request.headers.get("x-request-id") or request_id_var.get()
+    headers = {"X-Request-Id": rid} if rid else None
+    return JSONResponse(
+        status_code=HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": exc.errors(), "request_id": rid},
+        headers=headers,
+    )
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    rid = request.headers.get("x-request-id") or request_id_var.get()
+    headers = {"X-Request-Id": rid} if rid else None
+    return JSONResponse(status_code=500, content={"detail": "internal server error", "request_id": rid}, headers=headers)
 
 @app.get("/health/redis")
 def health_redis() -> dict:
@@ -84,7 +126,6 @@ def register(req: RegisterRequest) -> TokenResponse:
             object_id=str(user.id),
             meta={"email": str(req.email)},
         )
-
         session.commit()
 
         token = create_access_token(
@@ -129,22 +170,27 @@ def login(req: LoginRequest) -> TokenResponse:
 
 @app.get("/me", response_model=MeResponse)
 def me(ctx: TenantContext = Depends(get_ctx)) -> MeResponse:
-    return MeResponse(
-        user_id=str(ctx.user_id),
-        tenant_id=str(ctx.tenant_id),
-        role=ctx.role,
-        email=ctx.email,
-    )
-
+    return MeResponse(user_id=str(ctx.user_id), tenant_id=str(ctx.tenant_id), role=ctx.role, email=ctx.email)
 
 app.include_router(evidence_router)
 app.include_router(passport_router)
-
 app.include_router(questionnaires_router)
 app.include_router(health_router)
 app.include_router(audit_router)
 app.include_router(activity_router)
 app.include_router(tenant_settings_router)
 app.include_router(tenant_overrides_router)
+app.include_router(share_links_router)
+app.include_router(share_public_router)
+app.include_router(exports_router)
+app.include_router(evidence_freshness_router)
+app.include_router(freshness_router)
+app.include_router(ops_router)
+app.include_router(version_router)
+app.include_router(ops_config_router)
+app.include_router(ops_extra_router)
 
-
+app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RateLimitMiddleware, rules=default_rate_limit_rules())
+app.add_middleware(SentryContextMiddleware)

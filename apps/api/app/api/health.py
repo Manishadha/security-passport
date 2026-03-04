@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import os
-
 import redis
 from fastapi import APIRouter
-from minio import Minio
 from sqlalchemy import text
 
+from app.core.settings import settings
+from app.core.storage import s3_client
 from app.db.session import SessionLocal
 
 router = APIRouter(prefix="/health", tags=["health"])
@@ -23,42 +22,52 @@ def ready():
     redis_ok = False
     minio_ok = False
 
+    # --- DB ---
     try:
         with SessionLocal() as s:
             s.execute(text("select 1"))
         db_ok = True
     except Exception:
-        pass
+        db_ok = False
 
+    
     try:
-        r = redis.from_url(os.environ["REDIS_URL"])
-        r.ping()
-        redis_ok = True
-    except Exception:
-        pass
-
-    try:
-        client = Minio(
-            os.environ.get("MINIO_ENDPOINT") or os.environ["S3_ENDPOINT"].replace("http://","").replace("https://",""),
-            access_key=os.environ.get("MINIO_ACCESS_KEY") or os.environ["S3_ACCESS_KEY"],
-            secret_key=os.environ.get("MINIO_SECRET_KEY") or os.environ["S3_SECRET_KEY"],
-            secure=False,
+        r = redis.Redis.from_url(
+            settings.redis_url,
+            socket_connect_timeout=1,
+            socket_timeout=1,
         )
-        client.list_buckets()
+        redis_ok = (r.ping() is True)
+    except Exception:
+        redis_ok = False
+
+    
+    try:
+        s3 = s3_client()
+        s3.list_buckets()
         minio_ok = True
     except Exception:
-        pass
+        minio_ok = False
 
-    if db_ok and redis_ok and minio_ok:
-        return {"status": "ready"}
+    status = "ready" if (db_ok and redis_ok and minio_ok) else "not_ready"
+    return {"status": status, "db": db_ok, "redis": redis_ok, "minio": minio_ok}
 
-    return {"status": "not_ready", "db": db_ok, "redis": redis_ok, "minio": minio_ok}
 
 @router.get("/env")
 def env():
+    
     import os
-    return {
-        "REDIS_URL": os.getenv("REDIS_URL"),
-        "S3_ENDPOINT": os.getenv("S3_ENDPOINT"),
-    }
 
+    return {
+        "env": {
+            "REDIS_URL": os.getenv("REDIS_URL"),
+            "S3_ENDPOINT": os.getenv("S3_ENDPOINT"),
+            "MINIO_ENDPOINT": os.getenv("MINIO_ENDPOINT"),
+        },
+        "settings": {
+            "redis_url": getattr(settings, "redis_url", None),
+            "s3_bucket": getattr(settings, "s3_bucket", None),
+            "s3_endpoint": getattr(settings, "s3_endpoint", None),
+            "s3_endpoint_url": getattr(settings, "s3_endpoint_url", None),
+        },
+    }

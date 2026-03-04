@@ -1,16 +1,19 @@
 import uuid
 from dataclasses import dataclass
-from fastapi import Depends, HTTPException
+
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.log_context import tenant_id_var, user_id_var
 from app.core.security import decode_access_token
 from app.core.settings import settings
 from app.db.session import SessionLocal
 from app.models.core import Membership, User
 
 bearer = HTTPBearer(auto_error=False)
+
 
 @dataclass(frozen=True)
 class TenantContext:
@@ -19,14 +22,17 @@ class TenantContext:
     role: str
     email: str
 
+
 def get_db() -> Session:
     db = SessionLocal()
     try:
-        return db
+        yield db
     finally:
-        pass
+        db.close()
+
 
 def get_ctx(
+    request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(bearer),
     db: Session = Depends(get_db),
 ) -> TenantContext:
@@ -54,8 +60,13 @@ def get_ctx(
     membership = db.execute(
         select(Membership).where(Membership.user_id == user_id, Membership.tenant_id == tenant_uuid)
     ).scalar_one_or_none()
-
     if membership is None:
         raise HTTPException(status_code=403, detail="not a member")
+
+    request.state.tenant_id = str(tenant_uuid)
+    request.state.user_id = str(user_id)
+
+    tenant_id_var.set(str(tenant_uuid))
+    user_id_var.set(str(user_id))
 
     return TenantContext(tenant_id=tenant_uuid, user_id=user_id, role=membership.role, email=user.email)

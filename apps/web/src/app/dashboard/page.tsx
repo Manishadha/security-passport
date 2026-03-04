@@ -1,10 +1,11 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { api, clearToken, getToken, type MeResponse, type TenantOverrides } from "@/lib/api";
+import { api, clearToken, type TenantOverrides, type EvidenceItem } from "@/lib/api";
+import { useRouter } from "next/navigation";
 
 async function downloadWithAuth(url: string, filename: string) {
-  const token = getToken();
+  const token = localStorage.getItem("sp_token");
   if (!token) throw new Error("Missing token (please login again)");
 
   const res = await fetch(url, {
@@ -32,36 +33,54 @@ async function downloadWithAuth(url: string, filename: string) {
 }
 
 export default function DashboardPage() {
+  const router = useRouter();
+
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string>("");
-  const [me, setMe] = useState<MeResponse | null>(null);
+
+  const [me, setMe] = useState<Awaited<ReturnType<typeof api.me>> | null>(null);
   const [overrides, setOverrides] = useState<TenantOverrides>({});
 
-  const tokenPresent = Boolean(getToken());
+  const [evidenceCount, setEvidenceCount] = useState(0);
+  const [uploadedCount, setUploadedCount] = useState(0);
+
+  const [file, setFile] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
+
   const templateCode = useMemo(() => "vendor_security_basics", []);
-  const zipUrl = api.passportZipUrl(templateCode);
-  const docxUrl = api.passportDocxUrl(templateCode);
 
   async function loadAll() {
     setErr("");
     setLoading(true);
     try {
-      // these throw clean errors if token is missing/invalid
       const meRes = await api.me();
       setMe(meRes);
 
       const ov = await api.getOverrides();
       setOverrides(ov.overrides ?? {});
+
+      // lightweight evidence summary
+      const ev: EvidenceItem[] = await api.listEvidencePaged({ limit: 200, offset: 0, include_deleted: false });
+      const total = ev?.length ?? 0;
+      const uploaded = (ev ?? []).filter((x) => Boolean(x.uploaded_at) && Boolean(x.storage_key) && !x.deleted_at).length;
+
+      setEvidenceCount(total);
+      setUploadedCount(uploaded);
     } catch (e: any) {
-      setMe(null);
-      setOverrides({});
       setErr(e?.message ?? String(e));
+      setMe(null);
+      setEvidenceCount(0);
+      setUploadedCount(0);
     } finally {
       setLoading(false);
     }
   }
 
   useEffect(() => {
+    if (!localStorage.getItem("sp_token")) {
+      router.push("/login");
+      return;
+    }
     loadAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -76,21 +95,44 @@ export default function DashboardPage() {
     }
   }
 
-  function logout() {
-    clearToken();
-    window.location.href = "/login";
+  async function quickUpload() {
+    setErr("");
+    if (!file) {
+      setErr("Pick a file first");
+      return;
+    }
+    setUploading(true);
+    try {
+      const created = await api.createEvidence({
+        title: file.name,
+        original_filename: file.name,
+        content_type: file.type || "application/octet-stream",
+        size_bytes: file.size,
+        tags: [],
+        category: null,
+      });
+
+      // upload (will be protected by B) if already uploaded
+      await api.uploadEvidenceFile(created.id, file);
+
+      setFile(null);
+      await loadAll();
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setUploading(false);
+    }
   }
 
+  const zipUrl = api.passportZipUrl(templateCode);
+  const docxUrl = api.passportDocxUrl(templateCode);
+
   return (
-    <div style={{ padding: 24, maxWidth: 900, margin: "0 auto" }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-        <h1 style={{ fontSize: 28, marginBottom: 8 }}>Dashboard</h1>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <span style={{ fontSize: 12, color: "#666" }}>
-            Token: <b>{tokenPresent ? "present" : "missing"}</b>
-          </span>
-          <button onClick={logout}>Logout</button>
-        </div>
+    <div style={{ padding: 24, maxWidth: 1000, margin: "0 auto" }}>
+      <h1 style={{ fontSize: 28, marginBottom: 10 }}>Dashboard</h1>
+      <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+        <button onClick={() => router.push("/evidence")}>Evidence Library</button>
+        <button onClick={() => router.push("/share-links")}>Share Links</button>
       </div>
 
       {loading && <p>Loading…</p>}
@@ -104,39 +146,33 @@ export default function DashboardPage() {
       {!loading && (
         <>
           <section style={{ padding: 16, border: "1px solid #ddd", borderRadius: 8, marginBottom: 16 }}>
-            <h2 style={{ marginTop: 0 }}>Session</h2>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+              <h2 style={{ marginTop: 0 }}>Session</h2>
+              <div style={{ display: "flex", gap: 10 }}>
+                <button onClick={() => router.push("/evidence")}>Evidence Library</button>
+                <button onClick={() => router.push("/share-links")}>Share Links</button>
+                <button onClick={loadAll}>Refresh</button>
+                <button
+                  onClick={() => {
+                    clearToken();
+                    router.push("/login");
+                  }}
+                >
+                  Logout
+                </button>
+              </div>
+            </div>
+
             {me ? (
               <ul style={{ margin: 0, paddingLeft: 18 }}>
-                <li>
-                  <b>Email:</b> {me.email}
-                </li>
-                <li>
-                  <b>Role:</b> {me.role}
-                </li>
-                <li>
-                  <b>Tenant:</b> {me.tenant_id}
-                </li>
-                <li>
-                  <b>User:</b> {me.user_id}
-                </li>
+                <li><b>Email:</b> {me.email}</li>
+                <li><b>Role:</b> {me.role}</li>
+                <li><b>Tenant:</b> {me.tenant_id}</li>
+                <li><b>User:</b> {me.user_id}</li>
               </ul>
             ) : (
-              <p>No session loaded (login token missing/invalid)</p>
+              <p>No session loaded (login again)</p>
             )}
-
-            <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
-              <button onClick={loadAll}>Refresh</button>
-              <button
-                onClick={() => {
-                  clearToken();
-                  setErr("Token cleared. Please login again.");
-                  setMe(null);
-                  setOverrides({});
-                }}
-              >
-                Clear token
-              </button>
-            </div>
           </section>
 
           <section style={{ padding: 16, border: "1px solid #ddd", borderRadius: 8, marginBottom: 16 }}>
@@ -178,6 +214,28 @@ export default function DashboardPage() {
             </pre>
           </section>
 
+          <section style={{ padding: 16, border: "1px solid #ddd", borderRadius: 8, marginBottom: 16 }}>
+            <h2 style={{ marginTop: 0 }}>Evidence Summary</h2>
+
+            <div style={{ display: "flex", gap: 20, flexWrap: "wrap", alignItems: "center" }}>
+              <div><b>Total:</b> {evidenceCount}</div>
+              <div><b>Uploaded:</b> {uploadedCount}</div>
+              <div><b>Pending:</b> {Math.max(0, evidenceCount - uploadedCount)}</div>
+
+              <button onClick={() => router.push("/evidence")}>Open Evidence Library</button>
+            </div>
+
+            <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #eee" }}>
+              <div style={{ fontWeight: 600, marginBottom: 8 }}>Quick upload</div>
+              <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                <input type="file" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+                <button onClick={quickUpload} disabled={uploading}>
+                  {uploading ? "Uploading…" : "Upload"}
+                </button>
+              </div>
+            </div>
+          </section>
+
           <section style={{ padding: 16, border: "1px solid #ddd", borderRadius: 8 }}>
             <h2 style={{ marginTop: 0 }}>Passport Export</h2>
             <p style={{ marginTop: 0 }}>
@@ -213,8 +271,7 @@ export default function DashboardPage() {
             </div>
 
             <div style={{ marginTop: 10, fontSize: 12, color: "#666" }}>
-              Downloads use <code>fetch</code> so the <code>Authorization</code> header is included.
-              Opening the URL directly won’t include the token.
+              (Downloads are done via fetch so the Authorization header is included.)
             </div>
           </section>
         </>

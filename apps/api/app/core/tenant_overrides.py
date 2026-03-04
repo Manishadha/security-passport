@@ -5,12 +5,18 @@ from typing import Any, Dict, Tuple
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
+from zoneinfo import ZoneInfo
 
 ALLOWED_OVERRIDE_KEYS = {
     "ui_theme",
     "passport_zip_include_evidence",
     "passport_docx_include_evidence",
     "evidence_retention_days",
+    "evidence_expiring_days",
+    "freshness_scan_enabled",
+    "freshness_scan_timezone",
+    "freshness_scan_hour",
+    "freshness_scan_minute",
 }
 
 RESERVED_KEYS = {
@@ -39,20 +45,45 @@ def validate_overrides(input_settings: Dict[str, Any] | None) -> Dict[str, Any]:
             continue
 
         if key == "ui_theme":
-            if value not in ("dark", "light"):
-                continue
+            if value in ("dark", "light"):
+                cleaned[key] = value
+            continue
 
-        if key in ("passport_zip_include_evidence", "passport_docx_include_evidence"):
-            if not isinstance(value, bool):
-                continue
+        if key in ("passport_zip_include_evidence", "passport_docx_include_evidence", "freshness_scan_enabled"):
+            if isinstance(value, bool):
+                cleaned[key] = value
+            continue
 
         if key == "evidence_retention_days":
-            if not isinstance(value, int):
-                continue
-            if value < 1 or value > 3650:
-                continue
+            if isinstance(value, int) and 1 <= value <= 3650:
+                cleaned[key] = value
+            continue
 
-        cleaned[key] = value
+        if key == "evidence_expiring_days":
+            if isinstance(value, int) and 1 <= value <= 365:
+                cleaned[key] = value
+            continue
+
+        if key == "freshness_scan_timezone":
+            if isinstance(value, str):
+                tz = value.strip()
+                if tz:
+                    try:
+                        ZoneInfo(tz)
+                        cleaned[key] = tz
+                    except Exception:
+                        pass
+            continue
+
+        if key == "freshness_scan_hour":
+            if isinstance(value, int) and 0 <= value <= 23:
+                cleaned[key] = value
+            continue
+
+        if key == "freshness_scan_minute":
+            if isinstance(value, int) and 0 <= value <= 59:
+                cleaned[key] = value
+            continue
 
     return cleaned
 

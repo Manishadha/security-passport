@@ -2,7 +2,8 @@ import io
 import json
 import re
 import zipfile
-from datetime import datetime
+
+from datetime import datetime, timezone, timedelta
 from pathlib import PurePosixPath
 from typing import Any, Dict, List
 
@@ -14,6 +15,7 @@ from app.api.evidence import get_download_url
 from app.core.auth import TenantContext, get_ctx
 from app.db.session import SessionLocal
 from app.core.tenant_overrides import get_overrides
+from app.services.passport_zip import build_passport_zip_bytes
 
 
 router = APIRouter(prefix="/passport", tags=["passport"])
@@ -27,9 +29,38 @@ def _safe_zip_name(name: str, fallback: str) -> str:
         base = fallback
     return base[:120]
 
+def _to_utc(dt: Any) -> Any:
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _effective_expires_at_row(er: Dict[str, Any], retention_days: int | None) -> datetime | None:
+    explicit = _to_utc(er.get("expires_at"))
+    computed = None
+    if retention_days is not None and retention_days > 0:
+        uploaded_at = _to_utc(er.get("uploaded_at"))
+        if uploaded_at is not None:
+            computed = uploaded_at + timedelta(days=retention_days)
+    if explicit is None:
+        return computed
+    if computed is None:
+        return explicit
+    return explicit if explicit <= computed else computed
+
+def _freshness_status(effective_expires_at: datetime | None, now: datetime, expiring_days: int) -> str:
+    if effective_expires_at is None:
+        return "unknown"
+    if effective_expires_at <= now:
+        return "expired"
+    if effective_expires_at <= (now + timedelta(days=expiring_days)):
+        return "expiring"
+    return "fresh"
 
 def _build_pack_via_db(session, ctx, template_code: str) -> dict:
     import sqlalchemy as sa
+    from datetime import datetime, timezone
 
     md = sa.MetaData()
     bind = session.get_bind()
@@ -40,7 +71,9 @@ def _build_pack_via_db(session, ctx, template_code: str) -> dict:
         for name in candidates:
             if name in existing:
                 return name
-        raise RuntimeError(f"None of the table candidates exist: {candidates}. Existing: {sorted(existing)}")
+        raise RuntimeError(
+            f"None of the table candidates exist: {candidates}. Existing: {sorted(existing)}"
+        )
 
     t = sa.Table(
         pick_table("questionnaire_templates", "questionnaires_templates", "questionnaire_template"),
@@ -80,9 +113,32 @@ def _build_pack_via_db(session, ctx, template_code: str) -> dict:
 
     e = sa.Table("evidence_items", md, autoload_with=bind)
 
-    tpl_row = session.execute(sa.select(t).where(t.c.code == template_code)).mappings().first()
+    tpl_row = (
+        session.execute(sa.select(t).where(t.c.code == template_code))
+        .mappings()
+        .first()
+    )
     if not tpl_row:
         raise ValueError(f"Unknown template: {template_code}")
+
+    overrides = get_overrides(session, ctx.tenant_id)
+
+    raw_ret = overrides.get("evidence_retention_days", 90)
+    try:
+        retention_days = int(raw_ret)
+    except Exception:
+        retention_days = 90
+    if retention_days <= 0:
+        retention_days = None  # disable computed retention expiry
+
+    raw_exp = overrides.get("evidence_expiring_days", 14)
+    try:
+        expiring_days = int(raw_exp)
+    except Exception:
+        expiring_days = 14
+    expiring_days = max(1, min(365, expiring_days))
+
+    now = datetime.now(timezone.utc)
 
     pack = {
         "template": {
@@ -97,30 +153,53 @@ def _build_pack_via_db(session, ctx, template_code: str) -> dict:
         "evidence": [],
     }
 
-    questions = session.execute(
-        sa.select(q).where(q.c.template_id == tpl_row["id"]).order_by(q.c.key.asc())
-    ).mappings().all()
+    questions = (
+        session.execute(
+            sa.select(q)
+            .where(q.c.template_id == tpl_row["id"])
+            .order_by(q.c.key.asc())
+        )
+        .mappings()
+        .all()
+    )
 
     question_ids = [qu["id"] for qu in questions if qu.get("id") is not None]
 
     if question_ids and "question_id" in a.c:
-        answers_rows = session.execute(
-            sa.select(a).where(sa.and_(a.c.tenant_id == ctx.tenant_id, a.c.question_id.in_(question_ids)))
-        ).mappings().all()
+        answers_rows = (
+            session.execute(
+                sa.select(a).where(
+                    sa.and_(
+                        a.c.tenant_id == ctx.tenant_id,
+                        a.c.question_id.in_(question_ids),
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
     else:
-        answers_rows = session.execute(sa.select(a).where(a.c.tenant_id == ctx.tenant_id)).mappings().all()
+        answers_rows = (
+            session.execute(sa.select(a).where(a.c.tenant_id == ctx.tenant_id))
+            .mappings()
+            .all()
+        )
 
-    by_qid = {}
-    by_key = {}
+    by_qid: dict = {}
+    by_key: dict = {}
     for r in answers_rows:
         if "question_id" in r and r["question_id"] is not None:
             by_qid[r["question_id"]] = r
         if "question_key" in r and r["question_key"]:
             by_key[r["question_key"]] = r
 
-    ev_ids_by_answer = {}
+    ev_ids_by_answer: dict = {}
     if ae is not None:
-        link_rows = session.execute(sa.select(ae).where(ae.c.tenant_id == ctx.tenant_id)).mappings().all()
+        link_rows = (
+            session.execute(sa.select(ae).where(ae.c.tenant_id == ctx.tenant_id))
+            .mappings()
+            .all()
+        )
         for lr in link_rows:
             ev_ids_by_answer.setdefault(lr["answer_id"], []).append(lr["evidence_id"])
 
@@ -155,24 +234,51 @@ def _build_pack_via_db(session, ctx, template_code: str) -> dict:
         pack["answers"].append(item)
 
     if all_ev_ids:
-        ev_rows = session.execute(
-            sa.select(e).where(sa.and_(e.c.tenant_id == ctx.tenant_id, e.c.id.in_(list(all_ev_ids))))
-        ).mappings().all()
+        ev_rows = (
+            session.execute(
+                sa.select(e).where(
+                    sa.and_(
+                        e.c.tenant_id == ctx.tenant_id,
+                        e.c.id.in_(list(all_ev_ids)),
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
 
         for er in ev_rows:
+            eff = _effective_expires_at_row(er, retention_days)
             pack["evidence"].append(
                 {
                     "id": str(er["id"]),
                     "title": er.get("title"),
                     "description": er.get("description"),
+                    "category": er.get("category"),
+                    "tags": list(er.get("tags") or []),
                     "original_filename": er.get("original_filename"),
                     "uploaded_at": er.get("uploaded_at").isoformat() if er.get("uploaded_at") else None,
+                    "content_type": er.get("content_type"),
+                    "size_bytes": er.get("size_bytes"),
                     "storage_key": er.get("storage_key"),
                     "content_hash": er.get("content_hash"),
+                    "expires_at": er.get("expires_at").isoformat() if er.get("expires_at") else None,
+                    "effective_expires_at": eff.isoformat() if eff else None,
+                    "freshness_status": _freshness_status(eff, now, expiring_days),
+                    "last_verified_at": er.get("last_verified_at").isoformat() if er.get("last_verified_at") else None,
+                    "evidence_period_start": er.get("evidence_period_start").isoformat()
+                    if er.get("evidence_period_start")
+                    else None,
+                    "evidence_period_end": er.get("evidence_period_end").isoformat()
+                    if er.get("evidence_period_end")
+                    else None,
+                    "source_system": er.get("source_system"),
+                    "source_ref": er.get("source_ref"),
                 }
             )
 
     return pack
+
 def _apply_passport_overrides(pack: Dict[str, Any], overrides: Dict[str, Any], include_key: str) -> Dict[str, Any]:
     include_evidence = overrides.get(include_key, True)
     if include_evidence:
@@ -217,56 +323,49 @@ def export_passport_docx(template_code: str, ctx: TenantContext = Depends(get_ct
 def export_passport_zip(template_code: str, ctx: TenantContext = Depends(get_ctx)):
     with SessionLocal() as session:
         overrides = get_overrides(session, ctx.tenant_id)
+
         pack = _build_pack_via_db(session=session, ctx=ctx, template_code=template_code)
         pack = _apply_passport_overrides(pack, overrides, "passport_zip_include_evidence")
+
         docx_bytes = _render_docx_bytes(pack)
 
-        evidence_items: List[Dict[str, Any]] = pack.get("evidence", []) or []
+        include_evidence = overrides.get("passport_zip_include_evidence", True) is True
 
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            z.writestr("pack.json", json.dumps(pack, indent=2, ensure_ascii=False))
-            z.writestr("security_passport.docx", docx_bytes)
-
-            failures: List[str] = []
-            downloaded = 0
-
-            if evidence_items:
-                z.writestr("evidence/README.txt", "Evidence files attached to answers.\n")
-                z.writestr("evidence/_meta.txt", f"count={len(evidence_items)}\n")
-
-                with httpx.Client(timeout=30.0) as client:
-                    for ev in evidence_items:
-                        storage_key = ev.get("storage_key")
-                        if not storage_key:
-                            failures.append(f"{ev.get('id','')} missing_storage_key")
-                            continue
-
-                        name = _safe_zip_name(ev.get("original_filename") or "", f"{ev['id']}.bin")
-                        path_in_zip = f"evidence/files/{name}"
-
-                        try:
-                            dl = get_download_url(storage_key)
-                            url = dl["url"]
-
-                            with client.stream("GET", url) as r:
-                                r.raise_for_status()
-                                with z.open(path_in_zip, "w") as w:
-                                    for chunk in r.iter_bytes():
-                                        w.write(chunk)
-
-                            downloaded += 1
-                        except Exception as ex:
-                            failures.append(f"{ev.get('id','')} {name} {type(ex).__name__}")
-
-                if failures:
-                    z.writestr("evidence/_FAILED_DOWNLOADS.txt", "\n".join(failures) + "\n")
-
-        buf.seek(0)
-        filename = f"{template_code}_passport_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
-        return StreamingResponse(
-            buf,
-            media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        out_bytes, evr = build_passport_zip_bytes(
+            template_code=template_code,
+            tenant_id=str(ctx.tenant_id),
+            pack=pack,
+            docx_bytes=docx_bytes,
+            include_evidence=include_evidence,
         )
 
+        # audit (recommended)
+        try:
+            from app.core.audit import write_audit
+
+            write_audit(
+                db=session,
+                tenant_id=ctx.tenant_id,
+                actor_user_id=ctx.user_id,
+                action="passport.export",
+                object_type="questionnaire_template",
+                object_id=template_code,
+                meta={
+                    "format": "zip",
+                    "evidence_total": evr.evidence_total,
+                    "evidence_downloaded": evr.evidence_downloaded,
+                    "evidence_failed": evr.evidence_failed,
+                    "freshness_counts": evr.freshness_counts,
+                },
+            )
+            session.commit()
+        except Exception:
+            pass
+
+    buf = io.BytesIO(out_bytes)
+    filename = f"{template_code}_passport_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
